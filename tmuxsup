@@ -1,0 +1,4 @@
+#!/usr/bin/env bash
+# 启动器：无需安装，直接 ./tmuxsup run --interval 600
+export PYTHONPATH="$(dirname "$(readlink -f "$0")")${PYTHONPATH:+:$PYTHONPATH}"
+exec python3 -m tmux_supervisor "$@"

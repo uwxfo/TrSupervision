@@ -1,0 +1,11 @@
+{
+ "status": "running",
+ "run_id": "1793005487300068674",
+ "attempts": 1,
+ "last_check": "2026-10-26T09:04:37",
+ "reason": null,
+ "command": "bash train_detant_vidhoi.sh",
+ "log": "/home/yluo/RLIPVISTR/tmux_supervisor/logs/0-1793005487300068674.log",
+ "exit_file": "/home/yluo/RLIPVISTR/tmux_supervisor/state/0.1793005487300068674.exit",
+ "started_at": 1793005487.3001266
+}
