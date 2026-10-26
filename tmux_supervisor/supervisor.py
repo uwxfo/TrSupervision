@@ -1,21 +1,21 @@
-"""核心监督逻辑：对每个 tmux 窗口执行 检查 -> (重试 | 暂停 | 启动队列下一条)。
+"""核心监督逻辑：一个 Supervisor 只监督一个 tmux 窗口，反复 检查 -> (重试 | 移入 failed | 启动队列下一条 | 结束监控)。
 
 任务通过 send-keys 发到窗口的交互 shell 里执行，包装命令在结束时把退出码写入
 `<state_dir>/<窗口>.<run_id>.exit`，监督器据此判断成功/失败，不依赖解析屏幕输出。
 """
 import fcntl
 import json
+import os
 import re
 import shlex
 import subprocess
 import time
 import zipfile
-from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Optional
 
-from .tasks import Window, load_windows, move_first_task_to_worked
+from .tasks import Window, load_windows, move_task, parse_task
 from .tmuxctl import Tmux
 
 # 只匹配 CUDA 显存不足；"illegal memory access" 之类不是 OOM，减小 batch 没用。
@@ -26,9 +26,25 @@ BATCH_ARG_RE = re.compile(r"(--batch_size[ =])(\d+)")
 # 训练程序启动时会 print(args)，其中的 output_dir 即本次运行实际写 checkpoint 的目录（相对任务的 workdir）
 OUTPUT_DIR_RE = re.compile(r"output_dir='([^']+)'")
 RESUME_ARG_RE = re.compile(r"--resume(?:=|\s+)(?:'[^']*'|\"[^\"]*\"|\S+)")
-INTERRUPT_RCS = (130, 143)  # Ctrl-C / SIGTERM：视为人工中断，暂停而不重试
+# 130/143：Ctrl-C / SIGTERM；120：Python 退出时刷新 stdout 失败，Ctrl-C 经 tee 时常见（也可能是磁盘写满）。
+# 这些都按"手动中断"处理：自动结束监控，任务留在 task-list。
+INTERRUPT_RCS = (120, 130, 143)
 START_GRACE = 15  # 发出命令后，等多久才允许判定"窗口空闲却没有退出记录"（shell 启动子进程需要时间）
 LOG_TAIL_BYTES = 200_000  # 判断错误类型时只读日志末尾；找 output_dir 时读日志开头同样大小
+
+
+class MonitorStop(Exception):
+    """无法再安全地自动处理，需要结束监控（任务保持在 task-list 中）。"""
+
+    def __init__(self, reason: str):
+        super().__init__(reason)
+        self.reason = reason
+
+
+class AlreadyRunning(Exception):
+    def __init__(self, pid: Optional[int]):
+        super().__init__(f"a monitor is already running (pid {pid})")
+        self.pid = pid
 
 
 def safe(name: str) -> str:
@@ -51,158 +67,207 @@ def with_resume(cmd: str, ckpt: Path) -> str:
     return RESUME_ARG_RE.sub(lambda _: arg, cmd, count=1) if RESUME_ARG_RE.search(cmd) else f"{cmd} {arg}"
 
 
+# ---------- 每个窗口只允许一个监控进程：文件锁（进程结束自动释放）+ 锁文件里记录 pid 和窗口名 ----------
+def acquire_lock(state_dir: Path, name: str):
+    state_dir.mkdir(parents=True, exist_ok=True)
+    f = open(state_dir / f"{safe(name)}.lock", "a+")  # 先不截断：别的进程可能正持有并写着自己的 pid
+    try:
+        fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        f.seek(0)
+        first = f.readline().strip()
+        f.close()
+        raise AlreadyRunning(int(first) if first.isdigit() else None)
+    f.seek(0)
+    f.truncate()
+    f.write(f"{os.getpid()}\n{name}\n")
+    f.flush()
+    return f  # 调用方持有它直到监控结束
+
+
+def running_monitors(state_dir: Path) -> Dict[str, int]:
+    """{窗口名: pid}，只含当前确实持有锁（即正在运行）的监控。"""
+    out: Dict[str, int] = {}
+    for p in Path(state_dir).glob("*.lock"):
+        with open(p, "r+") as f:
+            try:
+                fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                lines = f.read().split("\n")
+                if lines and lines[0].isdigit() and len(lines) > 1:
+                    out[lines[1]] = int(lines[0])
+    return out
+
+
 class Supervisor:
-    def __init__(self, task_file: Path, state_dir: Path, log_dir: Path, tmux: Tmux,
-                 max_retries: int = 3, only: Optional[List[str]] = None,
-                 auto_resume: bool = True, echo=lambda s: print(s, flush=True)):
+    def __init__(self, task_file: Path, state_dir: Path, log_dir: Path, tmux: Tmux, name: str,
+                 max_retries: int = 3, retry_delay: float = 10.0, auto_resume: bool = True,
+                 start_grace: float = START_GRACE, echo=lambda s: print(s, flush=True)):
         self.task_file, self.state_dir, self.log_dir = Path(task_file), Path(state_dir), Path(log_dir)
-        self.tmux, self.max_retries, self.only, self.echo = tmux, max_retries, only, echo
-        self.auto_resume = auto_resume
+        self.tmux, self.name = tmux, name
+        self.max_retries, self.retry_delay, self.auto_resume = max_retries, retry_delay, auto_resume
+        self.start_grace, self.echo = start_grace, echo
+        self._stop = False
         self.state_dir.mkdir(parents=True, exist_ok=True)
         self.log_dir.mkdir(parents=True, exist_ok=True)
 
     # ---------- 状态与事件 ----------
-    def _state_path(self, name: str) -> Path:
-        return self.state_dir / f"{safe(name)}.json"
+    @property
+    def _state_path(self) -> Path:
+        return self.state_dir / f"{safe(self.name)}.json"
 
-    def load_state(self, name: str) -> dict:
+    def load_state(self) -> dict:
         try:
-            return json.loads(self._state_path(name).read_text())
+            return json.loads(self._state_path.read_text())
         except FileNotFoundError:
             return {"status": "idle", "run_id": None, "attempts": 0}
 
-    def _save(self, name: str, st: dict) -> None:
-        tmp = self._state_path(name).with_suffix(".json.tmp")
+    def _save(self, st: dict) -> None:
+        tmp = self._state_path.with_suffix(".json.tmp")
         tmp.write_text(json.dumps(st, ensure_ascii=False, indent=1))
-        tmp.replace(self._state_path(name))
+        tmp.replace(self._state_path)
 
-    def event(self, name: str, msg: str) -> None:
-        line = f"{datetime.now().isoformat(timespec='seconds')} [{name}] {msg}"
-        self.echo(line)
+    def reset(self) -> None:
+        """新的监控不继承旧状态：删掉状态文件和上次遗留的退出记录。"""
+        self._state_path.unlink(missing_ok=True)
+        for p in self.state_dir.glob(f"{safe(self.name)}.*.exit*"):
+            p.unlink(missing_ok=True)
+
+    def event(self, msg: str, extra: List[str] = ()) -> None:
+        line = f"{datetime.now().isoformat(timespec='seconds')} [{self.name}] {msg}"
+        text = "\n".join([line] + [f"    {l}" for l in extra])
+        self.echo(text)
         with open(self.state_dir / "events.log", "a") as f:
-            f.write(line + "\n")
+            f.write(text + "\n")
 
-    @contextmanager
-    def _window_lock(self, name: str):
-        # 每个窗口一把锁：允许多个监督进程分别监督不同窗口，同一窗口不会被并发处理。
-        with open(self.state_dir / f"{safe(name)}.lock", "w") as f:
-            try:
-                fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            except BlockingIOError:
-                yield False
-                return
-            yield True
+    def request_stop(self) -> None:
+        self._stop = True
 
-    # ---------- 对外接口 ----------
-    def window_names(self) -> List[str]:
-        names = list(load_windows(self.task_file))
-        return [n for n in names if self.only is None or n in self.only]
+    def _sleep(self, seconds: float) -> None:
+        end = time.time() + seconds
+        while not self._stop and time.time() < end:
+            time.sleep(min(0.2, max(0.0, end - time.time())))
 
-    def exit_pending(self, name: str) -> bool:
-        """当前任务的退出记录是否已出现（用于不等满周期就立即处理）。"""
-        ef = self.load_state(name).get("exit_file")
-        return bool(ef) and Path(ef).exists()
+    # ---------- 单次检查 ----------
+    def needs_attention(self) -> bool:
+        """不等满周期就该立即检查吗：当前任务的退出记录已出现，或任务应在运行但窗口已空闲（没有退出记录的中断）。"""
+        st = self.load_state()
+        if not st.get("run_id"):
+            return False
+        if Path(st["exit_file"]).exists():
+            return True
+        pid = self.tmux.pane_pid(self.name)
+        return pid is not None and not self.tmux.busy(pid)
 
-    def check(self, name: str) -> None:
-        with self._window_lock(name) as ok:
-            if ok:
-                self._check(name)
-
-    def resume(self, name: str) -> None:
-        st = self.load_state(name)
-        if st["status"] == "paused":
-            st.update(status="idle", attempts=0, run_id=None, exit_file=None, reason=None)
-            self._save(name, st)
-            self.event(name, "已手动恢复")
-
-    # ---------- 单窗口检查 ----------
-    def _check(self, name: str) -> None:
-        try:
-            w = load_windows(self.task_file).get(name)
-        except (OSError, ValueError) as e:
-            self.event(name, f"异常：读取 {self.task_file} 失败：{e}")
-            return
+    def _window(self) -> Window:
+        w = load_windows(self.task_file).get(self.name)
         if w is None:
-            return
-        st = self.load_state(name)
-        st["last_check"] = datetime.now().isoformat(timespec="seconds")
-        if st["status"] == "paused":
-            self._save(name, st)
-            return
+            raise MonitorStop(f"the task file has no queue for window {self.name}")
+        return w
 
-        pid = self.tmux.pane_pid(name)
-        if pid is None:
-            if st["status"] != "no-session":
-                self.event(name, "tmux 窗口不存在；等待其出现（不会自动创建）")
-            st["status"] = "no-session"
-            self._save(name, st)
+    def check(self) -> None:
+        """检查一次；遇到无法自动处理的情况抛出 MonitorStop。"""
+        try:
+            w = self._window()
+        except (OSError, ValueError) as e:
+            self.event(f"error: failed to read {self.task_file}: {e}")
             return
-        if st["status"] == "no-session":
-            st["status"] = "running" if st.get("run_id") else "idle"
+        pid = self.tmux.pane_pid(self.name)
+        if pid is None:
+            raise MonitorStop(f"tmux window {self.name} does not exist or was closed")
+        st = self.load_state()
+        st["last_check"] = datetime.now().isoformat(timespec="seconds")
 
         if st.get("run_id"):
             exit_file = Path(st["exit_file"])
             if exit_file.exists():
-                # 退出记录已写入，但 tee 可能还没收尾；等 shell 空闲再动作，否则下一轮重试
+                # 退出记录已写入，但 tee 可能还没收尾；等 shell 空闲再动作，否则下一轮再处理
                 if not self.tmux.wait_idle(pid, 10):
-                    self._save(name, st)
+                    self._save(st)
                     return
                 rc = int(exit_file.read_text().strip() or 1)
                 exit_file.unlink()
                 self._on_exit(w, st, rc)
             elif self.tmux.busy(pid):
                 st["status"] = "running"
-                self._save(name, st)
-            elif time.time() - st["started_at"] < START_GRACE:
-                self._save(name, st)
+                self._save(st)
+            elif time.time() - st["started_at"] < self.start_grace:
+                self._save(st)
             else:
-                self._pause(w, st, "窗口已空闲但没有退出记录，疑似被人工中断或终端被关闭")
+                self._save(st)
+                raise MonitorStop(f"the window is idle but there is no exit record (process killed or terminal closed); "
+                                  f"the task stays in task-list: {st['command']}")
             return
 
         if self.tmux.busy(pid):
-            st["status"] = "external"  # 窗口里有不是本工具启动的命令在跑，等它结束
-            self._save(name, st)
+            if st["status"] != "external":
+                self.event("a command not started by this tool is running in the window; waiting for it to finish (it will not be retried)")
+            st["status"] = "external"
+            self._save(st)
             return
         self._start_next(w, st)
 
-    def _pause(self, w: Window, st: dict, reason: str) -> None:
-        st.update(status="paused", reason=reason, run_id=None, exit_file=None)
-        self._save(w.name, st)
-        self.event(w.name, f"暂停：{reason}（处理后执行 resume {w.name}）")
+    def _clear_run(self, st: dict) -> None:
+        st.update(status="idle", run_id=None, exit_file=None, attempts=0)
+        self._save(st)
 
     def _on_exit(self, w: Window, st: dict, rc: int) -> None:
         cmd = st["command"]
         if rc == 0:
-            self.event(w.name, f"完成：{cmd}")
-            st.update(status="idle", run_id=None, exit_file=None, attempts=0)
-            self._start_next(w, st)
+            self.event(f"done: {cmd}")
+            if not move_task(self.task_file, self.name, st["raw"], "worked", self._done_note(st)):
+                self.event("warning: this command is no longer in task-list; not recorded in worked list")
+            self._clear_run(st)
+            self._start_next(self._window(), st)
         elif rc in INTERRUPT_RCS:
-            self._pause(w, st, f"命令收到人工中断（退出码 {rc}）：{cmd}")
+            self._clear_run(st)
+            raise MonitorStop(f"task interrupted manually (exit code {rc}); the task stays in task-list: {cmd}")
         else:
             self._retry(w, st, rc)
+
+    def _done_note(self, st: dict) -> str:
+        """worked list 条目的注释：本次成功运行的日志位置，以及日志里 output_dir 对应的输出目录（若有）。"""
+        note = f"log={st['log']}"
+        m = OUTPUT_DIR_RE.search(self._log_head(st["log"]))
+        if m:
+            note += f" output_dir={os.path.normpath(os.path.join(st['workdir'], m.group(1)))}"
+        return note
+
+    def _fail(self, st: dict, note: str, log_lines: bool = False) -> None:
+        """把当前任务移入 failed list，把原因打印到终端，窗口继续下一条。"""
+        extra = self._last_lines(st.get("log"), 3) if log_lines else []
+        if move_task(self.task_file, self.name, st["raw"], "failed", note):
+            self.event(f"FAILED: {st['raw']} -> moved to failed list: {note}", extra)
+        else:
+            self.event(f"FAILED: {st['raw']}: {note} (command no longer in task-list; not written to failed list)", extra)
+        self._clear_run(st)
+        self._start_next(self._window(), st)
 
     def _retry(self, w: Window, st: dict, rc: int) -> None:
         cmd = st["command"]
         if st["attempts"] >= self.max_retries:
-            return self._pause(w, st, f"重试 {self.max_retries} 次仍失败（退出码 {rc}）：{cmd}")
+            return self._fail(st, f"exceeded max_retries={self.max_retries} (exit code {rc})", log_lines=True)
         if OOM_RE.search(self._log_tail(st["log"])):
             # 仅 CUDA OOM 才减小 batch_size；其他错误（读写错误等）保持原命令重试
             hits = list(BATCH_ARG_RE.finditer(cmd))
             if not hits or int(hits[-1].group(2)) <= 1:
-                return self._pause(w, st, f"CUDA OOM，但命令中没有可再减小的 --batch_size N：{cmd}")
+                return self._fail(st, "CUDA OOM and the command has no reducible --batch_size N", log_lines=True)
             m = hits[-1]  # 多次出现时 argparse 以最后一个为准
             old = int(m.group(2))
             new = max(1, old // 2)
-            self.event(w.name, f"CUDA OOM：--batch_size {old} -> {new}")
+            self.event(f"CUDA OOM: --batch_size {old} -> {new}")
             cmd = cmd[:m.start(2)] + str(new) + cmd[m.end(2):]
-            st["command"] = cmd  # 后续重试在已减半的命令上继续减半
         else:
-            self.event(w.name, f"命令失败（退出码 {rc}），原配置重试")
+            self.event(f"command failed (exit code {rc}); retrying unchanged")
         st["attempts"] += 1
-        self.event(w.name, f"第 {st['attempts']}/{self.max_retries} 次重试")
-        self._launch(w, st, cmd, self._resume_cmd(w, st, cmd))
+        st["command"] = cmd  # 后续重试在已减半的命令上继续减半
+        self.event(f"retry {st['attempts']}/{self.max_retries}, starting in {self.retry_delay:g}s")
+        self._sleep(self.retry_delay)
+        if self._stop:  # 等待期间收到 stop：不再启动，任务仍在 task-list
+            return self._clear_run(st)
+        self._launch(w, st, cmd, self._resume_cmd(st, cmd))
 
-    def _resume_cmd(self, w: Window, st: dict, cmd: str) -> str:
+    def _resume_cmd(self, st: dict, cmd: str) -> str:
         """重试时从上一次运行写出的最新 checkpoint 续训；找不到就原样重跑。
 
         run_cmd 只用于本次发送，st["command"] 仍保留不带自动 --resume 的原命令，
@@ -212,50 +277,54 @@ class Supervisor:
             return cmd
         m = OUTPUT_DIR_RE.search(self._log_head(st["log"]))
         if not m:
-            self.event(w.name, "日志里没有 output_dir，无法定位 checkpoint，原命令重试")
+            self.event("no output_dir in the log; cannot locate a checkpoint; retrying unchanged")
             return cmd
-        out_dir = Path(w.workdir) / m.group(1)  # 绝对路径时 Path 会忽略前缀
+        out_dir = Path(st["workdir"]) / m.group(1)  # 绝对路径时 Path 会忽略前缀
         ckpt = find_checkpoint(out_dir)
         if ckpt is None:
-            self.event(w.name, f"{out_dir} 中没有可用的 checkpoint，从头重跑")
+            self.event(f"no usable checkpoint in {out_dir}; restarting from scratch")
             return cmd
-        self.event(w.name, f"自动续训：--resume {ckpt}")
+        self.event(f"auto-resume: --resume {ckpt}")
         return with_resume(cmd, ckpt)
 
     def _start_next(self, w: Window, st: dict) -> None:
-        if not w.tasks:
-            st["status"] = "idle"
-            st["reason"] = "队列已空"
-            self._save(w.name, st)
-            return
-        line = w.tasks[0]
-        cmd = line
-        if subprocess.run(["bash", "-n", "-c", cmd], capture_output=True).returncode != 0:
-            return self._pause(w, st, f"队列首条命令有 shell 语法错误，未执行：{cmd}")
-        if not move_first_task_to_worked(self.task_file, w.name, line):
-            self.event(w.name, "task 文件在读取后被修改，下一轮再试")
-            self._save(w.name, st)
-            return
-        st["attempts"] = 0
-        st["reason"] = None
+        while True:
+            if not w.tasks:
+                if st.get("reason") != "queue empty":
+                    self.event("queue empty; waiting for new tasks")
+                st.update(status="idle", reason="queue empty")
+                self._save(st)
+                return
+            raw = w.tasks[0]
+            cmd, workdir = parse_task(raw, w.workdir)
+            if subprocess.run(["bash", "-n", "-c", cmd], capture_output=True).returncode == 0:
+                break
+            if not move_task(self.task_file, self.name, raw, "failed", "shell syntax error"):
+                self.event("the task file changed after it was read; will retry next round")
+                return
+            self.event(f"FAILED: {raw} -> moved to failed list: shell syntax error")
+            w = self._window()
+        # 命令留在 task-list 首行，成功后才移走（见 _on_exit）
+        st.update(raw=raw, attempts=0, workdir=workdir, reason=None)
         self._launch(w, st, cmd)
 
     def _launch(self, w: Window, st: dict, cmd: str, run_cmd: Optional[str] = None) -> None:
         run_cmd = run_cmd or cmd
         run_id = str(time.time_ns())
-        log = self.log_dir / f"{safe(w.name)}-{run_id}.log"
-        exit_file = self.state_dir / f"{safe(w.name)}.{run_id}.exit"
+        log = self.log_dir / f"{safe(self.name)}-{run_id}.log"
+        exit_file = self.state_dir / f"{safe(self.name)}.{run_id}.exit"
         # 子 shell + `bash -c`：任务里的 exit/cd 不会影响窗口 shell；退出码先写临时文件再 mv，保证读到的是完整内容。
-        wrapped = (f"( cd {shlex.quote(w.workdir)} && bash -c {shlex.quote(run_cmd)}; rc=$?; "
+        wrapped = (f"( cd {shlex.quote(st['workdir'])} && bash -c {shlex.quote(run_cmd)}; rc=$?; "
                    f"echo $rc > {shlex.quote(str(exit_file))}.tmp && "
                    f"mv {shlex.quote(str(exit_file))}.tmp {shlex.quote(str(exit_file))}; exit $rc ) "
                    f"2>&1 | tee -a {shlex.quote(str(log))}")
         st.update(status="running", run_id=run_id, command=cmd, log=str(log),
                   exit_file=str(exit_file), started_at=time.time())
-        self._save(w.name, st)  # 先落盘再发送，进程崩溃重启后仍能接上这次运行
-        self.event(w.name, f"启动：{run_cmd}")
-        self.tmux.send(w.name, wrapped)
+        self._save(st)  # 先落盘再发送，进程崩溃重启后仍能接上这次运行
+        self.event(f"start: {run_cmd}")
+        self.tmux.send(self.name, wrapped)
 
+    # ---------- 日志读取 ----------
     @staticmethod
     def _log_head(path: str) -> str:
         try:
@@ -274,18 +343,33 @@ class Supervisor:
         except OSError:
             return ""
 
+    def _last_lines(self, path: Optional[str], n: int) -> List[str]:
+        lines = [l.rstrip()[:200] for l in self._log_tail(path or "").splitlines() if l.strip()]
+        return lines[-n:]
+
     # ---------- 主循环 ----------
-    def run_forever(self, interval: float, poll: float = 2.0) -> None:
-        """每 interval 秒全量检查一次；其间每 poll 秒看一眼有没有任务刚结束，有就立即处理。"""
+    def run_forever(self, interval: float, poll: float = 2.0) -> int:
+        """每 interval 秒全量检查一次；其间每 poll 秒看一眼有没有任务刚结束，有就立即处理。
+
+        返回退出码：0 = 被 stop / Ctrl-C 正常结束；1 = 因无法自动处理的情况自动结束。
+        """
         next_full = 0.0
-        while True:
-            full = time.time() >= next_full
-            if full:
-                next_full = time.time() + interval
-            try:
-                for n in self.window_names():
-                    if full or self.exit_pending(n):
-                        self.check(n)
-            except (OSError, ValueError) as e:
-                self.echo(f"异常：{e}")
-            time.sleep(poll)
+        try:
+            while not self._stop:
+                full = time.time() >= next_full
+                if full:
+                    next_full = time.time() + interval
+                if full or self.needs_attention():
+                    try:
+                        self.check()
+                    except (OSError, ValueError) as e:
+                        self.event(f"error: {e}")
+                self._sleep(poll)
+        except MonitorStop as e:
+            self.event(f"monitor ended: {e.reason}")
+            return 1
+        except KeyboardInterrupt:
+            self.event("received Ctrl-C; monitor ended (tasks in tmux are not affected)")
+            return 0
+        self.event("received stop command; monitor ended (tasks in tmux are not affected)")
+        return 0

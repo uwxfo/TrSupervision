@@ -2,7 +2,7 @@
  "status": "running",
  "run_id": "1793006779254818375",
  "attempts": 1,
- "last_check": "2026-10-26T09:26:29",
+ "last_check": "2026-10-26T11:56:33",
  "reason": null,
  "command": "bash train_detant_vidhoi.sh --seed 126",
  "log": "/home/yluo/RLIPVISTR/tmux_supervisor/logs/1-1793006779254818375.log",

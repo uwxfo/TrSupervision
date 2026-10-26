@@ -1,15 +1,21 @@
 import os
+import re
+import signal
 import subprocess
+import sys
 import tempfile
+import threading
 import time
 import unittest
+import zipfile
 from pathlib import Path
 
-import zipfile
-
-from tmux_supervisor.supervisor import Supervisor, find_checkpoint, with_resume
-from tmux_supervisor.tasks import load_windows, move_first_task_to_worked
+from tmux_supervisor.supervisor import (AlreadyRunning, MonitorStop, Supervisor, acquire_lock,
+                                        find_checkpoint, running_monitors, with_resume)
+from tmux_supervisor.tasks import load_windows, move_task, parse_task
 from tmux_supervisor.tmuxctl import Tmux
+
+ROOT = Path(__file__).resolve().parent.parent
 
 TASKS = """# tmux: a
 workdir: /tmp
@@ -18,10 +24,14 @@ workdir: /tmp
 # 注释
 bash x.sh
 
-bash y.sh --batch_size 2
+[workdir=sub] bash y.sh --batch_size 2
+bash z.sh  # [failed old failure mark]
 
 ## worked list
 old
+
+## failed list
+bad  # [failed reason]
 
 # tmux: b
 ## task-list
@@ -36,20 +46,50 @@ class TaskFileTest(unittest.TestCase):
 
     def test_parse(self):
         w = load_windows(self.f)
-        self.assertEqual(w["a"].tasks, ["bash x.sh", "bash y.sh --batch_size 2"])
+        self.assertEqual(w["a"].tasks, ["bash x.sh", "[workdir=sub] bash y.sh --batch_size 2",
+                                        "bash z.sh  # [failed old failure mark]"])
+        self.assertEqual(w["a"].worked, ["old"])
+        self.assertEqual(w["a"].failed, ["bad  # [failed reason]"])  # failed list 不会被当成任务
         self.assertEqual(w["a"].workdir, "/tmp")
+        self.assertEqual(w["b"].tasks, ["bash z.sh"])
 
-    def test_move(self):
-        self.assertFalse(move_first_task_to_worked(self.f, "a", "bash nope"))
-        self.assertTrue(move_first_task_to_worked(self.f, "a", "bash x.sh"))
-        self.assertEqual(load_windows(self.f)["a"].tasks, ["bash y.sh --batch_size 2"])
-        text = self.f.read_text()
-        self.assertIn("old\nbash x.sh", text)
-        self.assertEqual(load_windows(self.f)["b"].tasks, ["bash z.sh"])  # 其他窗口不受影响
+    def test_parse_task(self):
+        self.assertEqual(parse_task("bash x.sh", "/w"), ("bash x.sh", "/w"))
+        self.assertEqual(parse_task("[workdir=sub] bash y.sh", "/w"), ("bash y.sh", "/w/sub"))
+        self.assertEqual(parse_task("[workdir=/abs] bash y.sh", "/w"), ("bash y.sh", "/abs"))
+        # 之前失败过的条目被移回队列时，剥掉固定格式的失败标记，否则自动加的 --resume 会被当成注释吞掉
+        self.assertEqual(parse_task("bash z.sh  # [failed exceeded max_retries=3]", "/w"), ("bash z.sh", "/w"))
+        self.assertEqual(parse_task("bash z.sh  # [done log=/x/y.log output_dir=/o]", "/w"), ("bash z.sh", "/w"))
+        self.assertEqual(parse_task("echo '#' # 普通注释", "/w")[0], "echo '#' # 普通注释")
 
-    def test_move_creates_worked_list(self):
-        self.assertTrue(move_first_task_to_worked(self.f, "b", "bash z.sh"))
-        self.assertTrue(self.f.read_text().rstrip().endswith("## worked list\nbash z.sh"))
+    def test_move_to_worked(self):
+        self.assertFalse(move_task(self.f, "a", "bash nope", "worked"))
+        self.assertTrue(move_task(self.f, "a", "bash x.sh", "worked"))
+        w = load_windows(self.f)
+        self.assertEqual(w["a"].worked, ["old", "bash x.sh"])
+        self.assertEqual(len(w["a"].tasks), 2)
+        self.assertEqual(w["b"].tasks, ["bash z.sh"])  # 其他窗口不受影响
+
+    def test_move_to_worked_with_note(self):
+        self.assertTrue(move_task(self.f, "a", "bash x.sh", "worked", "log=/l.log"))
+        self.assertEqual(load_windows(self.f)["a"].worked, ["old", "bash x.sh  # [done log=/l.log]"])
+
+    def test_move_to_failed_with_note_creates_section(self):
+        self.assertTrue(move_task(self.f, "b", "bash z.sh", "failed", "shell syntax error"))
+        w = load_windows(self.f)
+        self.assertEqual(w["b"].tasks, [])
+        self.assertEqual(w["b"].failed, ["bash z.sh  # [failed shell syntax error]"])
+        self.assertIn("## failed list", self.f.read_text())
+
+    def test_move_not_first_line(self):
+        # 用户在运行期间在前面插入了新行：按内容匹配，移走的是正在运行的那一条
+        self.assertTrue(move_task(self.f, "a", "bash z.sh  # [failed old failure mark]", "worked"))
+        self.assertEqual(load_windows(self.f)["a"].tasks[:2], ["bash x.sh", "[workdir=sub] bash y.sh --batch_size 2"])
+
+
+def plain(lines):
+    """去掉程序附加的 `# [done ...]` 注释，只比较命令本身。"""
+    return [re.sub(r"  # \[done .*\]$", "", l) for l in lines]
 
 
 def make_ckpt(path: Path, valid: bool = True):
@@ -84,38 +124,105 @@ class ResumeHelperTest(unittest.TestCase):
         self.assertEqual(with_resume("bash a.sh --resume=old.pth", p), "bash a.sh --resume '/a b/ck.pth'")
 
 
-class TmuxIntegrationTest(unittest.TestCase):
-    """用独立 socket 的真实 tmux server 跑端到端流程。"""
+class LockTest(unittest.TestCase):
+    def test_one_monitor_per_window(self):
+        state = Path(tempfile.mkdtemp())
+        h = acquire_lock(state, "w1")
+        with self.assertRaises(AlreadyRunning) as cm:
+            acquire_lock(state, "w1")
+        self.assertEqual(cm.exception.pid, os.getpid())
+        other = acquire_lock(state, "w2")  # 不同窗口互不影响
+        self.assertEqual(running_monitors(state), {"w1": os.getpid(), "w2": os.getpid()})
+        h.close()
+        other.close()
+        self.assertEqual(running_monitors(state), {})  # 进程/句柄结束后锁自动释放
+
+
+class TmuxCase(unittest.TestCase):
+    """用独立 socket 的真实 tmux server 跑端到端流程；每个测试独立 server，避免 kill-server 后立即复用 socket 的竞态。"""
 
     def setUp(self):
-        self.sock = f"tmuxsup-test-{os.getpid()}-{time.time_ns()}"  # 每个测试独立 server，避免 kill-server 后立即复用 socket 的竞态
+        self.sock = f"tmuxsup-test-{os.getpid()}-{time.time_ns()}"
         self.tm = Tmux(self.sock)
         self.dir = Path(tempfile.mkdtemp())
+        self.out = []  # 监控程序打印到终端的内容
         subprocess.run(["tmux", "-L", self.sock, "new-session", "-d", "-s", "w1", "-x", "200", "bash", "--norc"], check=True)
         self.addCleanup(lambda: subprocess.run(["tmux", "-L", self.sock, "kill-server"], capture_output=True))
-        self.sup = Supervisor(self.dir / "task.md", self.dir / "state", self.dir / "logs", self.tm, echo=lambda s: None)
+        self.sup = self.make()
 
-    def write_tasks(self, body, header="workdir: {d}\n"):
-        (self.dir / "task.md").write_text(f"# tmux: w1\n{header.format(d=self.dir)}{body}")
+    def make(self, **kw):
+        kw = {"retry_delay": 0.2, "start_grace": 1, **kw}
+        return Supervisor(self.dir / "task.md", self.dir / "state", self.dir / "logs", self.tm, "w1",
+                          echo=self.out.append, **kw)
+
+    def write_tasks(self, body, extra=""):
+        (self.dir / "task.md").write_text(f"# tmux: w1\nworkdir: {self.dir}\n{extra}\n{body}")
+
+    def win(self):
+        return load_windows(self.dir / "task.md")["w1"]
 
     def drive(self, cond, timeout=40):
         end = time.time() + timeout
         while time.time() < end:
-            self.sup.check("w1")
+            self.sup.check()
             if cond():
                 return
             time.sleep(0.3)
-        self.fail(f"超时；状态={self.sup.load_state('w1')}")
+        self.fail(f"超时；状态={self.sup.load_state()}；输出={self.out}")
 
-    def test_queue_runs_in_order(self):
-        self.write_tasks("## task-list\necho A >> out\necho B >> out\n")
+    def drive_until_stop(self, timeout=40) -> MonitorStop:
+        end = time.time() + timeout
+        while time.time() < end:
+            try:
+                self.sup.check()
+            except MonitorStop as e:
+                return e
+            time.sleep(0.3)
+        self.fail(f"超时，监控没有结束；状态={self.sup.load_state()}")
+
+    def text(self):
+        return "\n".join(self.out)
+
+
+class QueueTest(TmuxCase):
+    def test_task_stays_at_head_until_success_then_moves_to_worked(self):
+        self.write_tasks("## task-list\nsleep 3; echo A >> out\necho B >> out\n")
+        self.sup.check()  # 启动 A
+        self.assertEqual(self.win().tasks[0], "sleep 3; echo A >> out")  # 运行中仍在首行
+        self.assertEqual(self.win().worked, [])
         self.drive(lambda: (self.dir / "out").exists() and (self.dir / "out").read_text() == "A\nB\n"
-                   and self.sup.load_state("w1")["run_id"] is None)
-        self.assertEqual(load_windows(self.dir / "task.md")["w1"].tasks, [])
+                   and self.sup.load_state()["run_id"] is None)
+        self.assertEqual(self.win().tasks, [])
+        self.assertEqual(plain(self.win().worked), ["sleep 3; echo A >> out", "echo B >> out"])
 
+    def test_worked_entry_records_log_and_output_dir(self):
+        script = self.dir / "o.sh"
+        script.write_text("echo \"Namespace(output_dir='od')\"\n")
+        self.write_tasks(f"## task-list\nbash {script}\nbash -c 'true'\n")
+        self.drive(lambda: len(self.win().worked) == 2)
+        with_out, plain = self.win().worked
+        log = sorted((self.dir / "logs").glob("w1-*.log"))[0]
+        self.assertEqual(with_out, f"bash {script}  # [done log={log} output_dir={self.dir}/od]")
+        self.assertRegex(plain, r"^bash -c 'true'  # \[done log=\S+\.log\]$")  # 日志里没有 output_dir 时只记日志位置
+
+    def test_per_task_workdir_does_not_leak_to_following_tasks(self):
+        (self.dir / "sub").mkdir()
+        self.write_tasks(f"## task-list\n[workdir=sub] pwd >> {self.dir}/out\npwd >> {self.dir}/out\n")  # 用绝对路径写结果，因为第一条的 cwd 是 sub
+        self.drive(lambda: (self.dir / "out").exists() and len((self.dir / "out").read_text().split()) == 2
+                   and self.sup.load_state()["run_id"] is None)
+        self.assertEqual((self.dir / "out").read_text().split(),
+                         [str((self.dir / "sub").resolve()), str(self.dir.resolve())])
+
+    def test_empty_queue_is_idle_not_stopped(self):
+        self.write_tasks("## task-list\n")
+        self.sup.check()
+        self.assertEqual(self.sup.load_state()["status"], "idle")
+
+
+class RetryTest(TmuxCase):
     def test_oom_halves_batch_other_errors_keep_batch(self):
         script = self.dir / "t.sh"
-        # 第一次：BATCH_SIZE>2 报 CUDA OOM；之后：第一次遇到 flag 缺失时报 IO 错误，再之后成功
+        # --batch_size>2 报 CUDA OOM；bs=2 时第一次报 IO 错误，再之后成功
         script.write_text(
             'BATCH_SIZE=$2\n'
             'echo "bs=$BATCH_SIZE" >> seen\n'
@@ -123,23 +230,45 @@ class TmuxIntegrationTest(unittest.TestCase):
             'if [ ! -f flag ]; then touch flag; echo "OSError: read failure" >&2; exit 1; fi\n'
             'echo ok >> seen\n')
         self.write_tasks(f"## task-list\nbash {script} --batch_size 8\n")
-        self.drive(lambda: "ok" in (self.dir / "seen").read_text() if (self.dir / "seen").exists() else False)
+        self.drive(lambda: (self.dir / "seen").exists() and "ok" in (self.dir / "seen").read_text())
         self.assertEqual((self.dir / "seen").read_text().split(), ["bs=8", "bs=4", "bs=2", "bs=2", "ok"])
 
-    def test_pause_after_max_retries(self):
-        self.sup.max_retries = 1
-        self.write_tasks("## task-list\nbash -c 'echo x >> n; exit 3'\necho never >> n\n")
-        self.drive(lambda: self.sup.load_state("w1")["status"] == "paused")
-        self.assertEqual((self.dir / "n").read_text().split(), ["x", "x"])  # 首次 + 1 次重试，后续任务不执行
-        self.sup.resume("w1")
-        self.assertEqual(self.sup.load_state("w1")["status"], "idle")
+    def test_exhausted_retries_go_to_failed_list_and_queue_continues(self):
+        self.sup = self.make(max_retries=1)
+        self.write_tasks("## task-list\nbash -c 'echo x >> n; exit 3'\necho next >> n\n")
+        self.drive(lambda: (self.dir / "n").exists() and "next" in (self.dir / "n").read_text()
+                   and self.sup.load_state()["run_id"] is None)
+        self.assertEqual((self.dir / "n").read_text().split(), ["x", "x", "next"])  # 首次 + 1 次重试，然后继续下一条
+        w = self.win()
+        self.assertEqual(w.failed, ["bash -c 'echo x >> n; exit 3'  # [failed exceeded max_retries=1 (exit code 3)]"])
+        self.assertEqual(plain(w.worked), ["echo next >> n"])
+        self.assertIn("exceeded max_retries=1", self.text())  # 原因打印到终端
 
-    def test_oom_without_batch_arg_pauses(self):
+    def test_oom_without_batch_arg_goes_to_failed_list(self):
         self.write_tasks("## task-list\nbash -c 'echo CUDA out of memory >&2; exit 1'\n")
-        self.drive(lambda: self.sup.load_state("w1")["status"] == "paused")
-        self.assertIn("--batch_size", self.sup.load_state("w1")["reason"])
+        self.drive(lambda: bool(self.win().failed))
+        self.assertIn("--batch_size", self.win().failed[0])
+        self.assertEqual(self.win().tasks, [])
 
-    def _resume_script(self, with_ckpt: bool):
+    def test_shell_syntax_error_goes_to_failed_list_and_queue_continues(self):
+        self.write_tasks("## task-list\necho 'unclosed\necho ok >> out\n")
+        self.drive(lambda: (self.dir / "out").exists())
+        self.assertEqual(self.win().failed, ["echo 'unclosed  # [failed shell syntax error]"])
+        self.assertIn("shell syntax error", self.text())
+
+    def test_retry_waits_retry_delay(self):
+        self.sup = self.make(max_retries=1, retry_delay=1.5)
+        stamps = []
+        orig = self.sup.echo
+        self.sup.echo = lambda s: (stamps.append(time.time()) if "start:" in s else None, orig(s))[1]
+        self.write_tasks("## task-list\nbash -c 'exit 3'\n")
+        self.drive(lambda: bool(self.win().failed))
+        self.assertEqual(len(stamps), 2)
+        self.assertGreaterEqual(stamps[1] - stamps[0], 1.4)
+
+
+class ResumeTest(TmuxCase):
+    def _script(self, with_ckpt: bool):
         # 第一次运行：打印 Namespace(output_dir=...)，可选地写出 checkpoint，然后失败；第二次运行：记录收到的参数
         script = self.dir / "r.sh"
         mk = ('python3 -c "import zipfile;zipfile.ZipFile(\'od/checkpoint.pth\',\'w\').writestr(\'a\',\'b\')"\n'
@@ -151,32 +280,183 @@ class TmuxIntegrationTest(unittest.TestCase):
         self.write_tasks(f"## task-list\nbash {script}\n")
 
     def test_retry_resumes_from_checkpoint(self):
-        self._resume_script(with_ckpt=True)
+        self._script(with_ckpt=True)
         self.drive(lambda: (self.dir / "seen").exists())
         self.assertEqual((self.dir / "seen").read_text().strip(), f"args: --resume {self.dir}/od/checkpoint.pth")
 
     def test_retry_without_checkpoint_reruns_as_is(self):
-        self._resume_script(with_ckpt=False)
+        self._script(with_ckpt=False)
         self.drive(lambda: (self.dir / "seen").exists())
         self.assertEqual((self.dir / "seen").read_text().strip(), "args:")
 
     def test_no_auto_resume_flag(self):
-        self.sup.auto_resume = False
-        self._resume_script(with_ckpt=True)
+        self.sup = self.make(auto_resume=False)
+        self._script(with_ckpt=True)
         self.drive(lambda: (self.dir / "seen").exists())
         self.assertEqual((self.dir / "seen").read_text().strip(), "args:")
 
-    def test_ctrl_c_pauses(self):
-        self.write_tasks("## task-list\nsleep 60\n")
-        self.drive(lambda: self.sup.load_state("w1")["status"] == "running")
+
+class AutoStopTest(TmuxCase):
+    """手动退出等无法判断的情况：监控自动结束（MonitorStop），任务留在 task-list 首行。"""
+
+    def assert_stopped_with_task_kept(self, e, reason_part):
+        self.assertIn(reason_part, e.reason)
+        self.assertEqual(self.win().tasks[0], self.task)
+        self.assertEqual((self.win().worked, self.win().failed), ([], []))
+
+    def test_ctrl_c_stops_monitor(self):
+        self.task = "sleep 60"
+        self.write_tasks(f"## task-list\n{self.task}\n")
+        self.sup.check()
         time.sleep(1)
         subprocess.run(["tmux", "-L", self.sock, "send-keys", "-t", "=w1:", "C-c"], check=True)
-        self.drive(lambda: self.sup.load_state("w1")["status"] == "paused")
+        e = self.drive_until_stop()
+        # Ctrl-C 的表现不固定：退出码 130/120，或子 shell 一并被中断而没有退出记录
+        self.assertTrue(any(k in e.reason for k in ("interrupted manually", "no exit record")), e.reason)
+        self.assertEqual(self.win().tasks[0], self.task)
+        self.assertEqual((self.win().worked, self.win().failed), ([], []))
 
-    def test_missing_session_does_not_crash(self):
-        (self.dir / "task.md").write_text("# tmux: nope\n## task-list\necho hi\n")
-        self.sup.check("nope")
-        self.assertEqual(self.sup.load_state("nope")["status"], "no-session")
+    def test_exit_code_120_stops_monitor(self):
+        self.task = "bash -c 'exit 120'"
+        self.write_tasks(f"## task-list\n{self.task}\n")
+        self.assert_stopped_with_task_kept(self.drive_until_stop(), "120")
+
+    def test_idle_window_without_exit_record_stops_monitor(self):
+        self.task = "sleep 60"
+        self.write_tasks(f"## task-list\n{self.task}\n")
+        self.sup.check()
+        time.sleep(1)
+        pane = self.tm.pane_pid("w1")
+        subprocess.run(["pkill", "-KILL", "-P", str(pane)])  # 连子 shell 带 tee 一起杀掉，退出记录不会被写出
+        self.assert_stopped_with_task_kept(self.drive_until_stop(), "no exit record")
+
+    def test_missing_tmux_window_stops_monitor(self):
+        self.write_tasks("## task-list\necho hi\n")
+        subprocess.run(["tmux", "-L", self.sock, "new-session", "-d", "-s", "keep", "bash", "--norc"], check=True)
+        subprocess.run(["tmux", "-L", self.sock, "kill-session", "-t", "=w1"], check=True)
+        with self.assertRaises(MonitorStop) as cm:
+            self.sup.check()
+        self.assertIn("does not exist", cm.exception.reason)
+
+
+class ExternalCommandTest(TmuxCase):
+    def test_waits_for_manually_started_command_and_prints_notice(self):
+        self.write_tasks("## task-list\necho queued >> out\n")
+        self.tm.send("w1", "sleep 4")  # 用户手动在窗口里跑的命令
+        time.sleep(0.5)
+        self.sup.check()
+        self.assertEqual(self.sup.load_state()["status"], "external")
+        self.assertIn("not started by this tool", self.text())
+        self.assertFalse((self.dir / "out").exists())
+        self.drive(lambda: (self.dir / "out").exists())
+
+
+class StartFreshTest(TmuxCase):
+    def test_reset_discards_previous_state(self):
+        self.write_tasks("## task-list\nsleep 30\n")
+        self.sup.check()
+        self.assertTrue(self.sup.load_state()["run_id"])
+        self.sup.reset()  # run 启动时调用：新的监控不继承旧状态
+        self.assertIsNone(self.sup.load_state()["run_id"])
+        self.sup.check()  # 旧任务仍在窗口里运行 -> 当作外部命令等待，不会重复启动
+        self.assertEqual(self.sup.load_state()["status"], "external")
+
+
+class RunLoopTest(TmuxCase):
+    def test_request_stop_ends_loop_with_code_0(self):
+        self.write_tasks("## task-list\nsleep 30\n")
+        result = []
+        t = threading.Thread(target=lambda: result.append(self.sup.run_forever(interval=600, poll=0.2)))
+        t.start()
+        time.sleep(2)
+        self.sup.request_stop()
+        t.join(10)
+        self.assertFalse(t.is_alive())
+        self.assertEqual(result, [0])
+        self.assertIn("stop", self.text())
+
+    def test_loop_notices_idle_window_without_waiting_for_interval(self):
+        # 没有退出记录时（如 Ctrl-C 把子 shell 一并中断），不应等到下一次全量检查（interval=600s）才发现
+        self.write_tasks("## task-list\nsleep 60\n")
+        self.addCleanup(self.sup.request_stop)
+        result = []
+        t = threading.Thread(target=lambda: result.append(self.sup.run_forever(interval=600, poll=0.2)))
+        t.start()
+        time.sleep(2)
+        subprocess.run(["pkill", "-KILL", "-P", str(self.tm.pane_pid("w1"))])
+        t.join(15)
+        self.assertFalse(t.is_alive(), "监控没有及时发现窗口已空闲")
+        self.assertEqual(result, [1])
+        self.assertIn("no exit record", self.text())
+
+    def test_loop_returns_1_on_auto_stop(self):
+        self.write_tasks("## task-list\nbash -c 'exit 120'\n")
+        self.assertEqual(self.sup.run_forever(interval=600, poll=0.2), 1)
+        self.assertIn("120", self.text())
+
+
+class CliTest(unittest.TestCase):
+    def setUp(self):
+        self.sock = f"tmuxsup-cli-{os.getpid()}-{time.time_ns()}"
+        self.dir = Path(tempfile.mkdtemp())
+        subprocess.run(["tmux", "-L", self.sock, "new-session", "-d", "-s", "w1", "bash", "--norc"], check=True)
+        self.addCleanup(lambda: subprocess.run(["tmux", "-L", self.sock, "kill-server"], capture_output=True))
+        (self.dir / "task.md").write_text(f"# tmux: w1\nworkdir: {self.dir}\n## task-list\nsleep 60\n")
+        self.common = ["--task-file", str(self.dir / "task.md"), "--state-dir", str(self.dir / "state"),
+                       "--log-dir", str(self.dir / "logs"), "--socket", self.sock]
+
+    def cli(self, *args, **kw):
+        return subprocess.run([str(ROOT / "tmuxsup"), *args], capture_output=True, text=True, timeout=30, **kw)
+
+    def start(self):
+        p = subprocess.Popen([str(ROOT / "tmuxsup"), "run", "w1", "--interval", "600", "--poll", "0.3", *self.common],
+                             stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+        self.addCleanup(p.stdout.close)
+        self.addCleanup(lambda: p.poll() is None and p.kill())  # 后注册先执行：先杀进程再关管道
+        end = time.time() + 15
+        while time.time() < end and "w1" not in running_monitors(self.dir / "state"):
+            time.sleep(0.2)
+        self.assertIn("w1", running_monitors(self.dir / "state"))
+        return p
+
+    def test_second_run_refused_then_stop_then_run_again(self):
+        p = self.start()
+        r = self.cli("run", "w1", *self.common)
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("already running", r.stdout + r.stderr)
+        r = self.cli("stop", "w1", "--state-dir", str(self.dir / "state"))
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertEqual(p.wait(15), 0)
+        self.assertIn("stop", p.stdout.read())
+        self.assertEqual(running_monitors(self.dir / "state"), {})
+        p2 = self.start()  # stop 之后可以重新 run
+        self.cli("stop", "--all", "--state-dir", str(self.dir / "state"))
+        self.assertEqual(p2.wait(15), 0)
+
+    def test_status_marks_state_as_stale_when_monitor_is_not_running(self):
+        r = self.cli("status", "w1", *self.common)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("monitor: not running", r.stdout)
+        self.assertIn("task-list: 1", r.stdout)
+        self.cli("once", "w1", *self.common)  # 启动 sleep 60 后监控就退出了，状态文件里仍记着 running
+        r = self.cli("status", "w1", *self.common)
+        self.assertIn("last recorded", r.stdout)  # 提示这是监控退出前最后记录的状态，不是实时的
+
+    def test_stop_when_not_running(self):
+        r = self.cli("stop", "w1", "--state-dir", str(self.dir / "state"))
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("No monitor is running", r.stdout + r.stderr)
+
+    def test_run_unknown_window_in_task_file(self):
+        r = self.cli("run", "nope", *self.common)
+        self.assertEqual(r.returncode, 2)
+        self.assertIn("nope", r.stdout + r.stderr)
+
+    def test_run_missing_tmux_window_exits_1(self):
+        (self.dir / "task.md").write_text("# tmux: ghost\n## task-list\necho hi\n")
+        r = self.cli("run", "ghost", *self.common)
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("does not exist", r.stdout + r.stderr)
 
 
 if __name__ == "__main__":
