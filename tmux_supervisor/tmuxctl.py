@@ -4,13 +4,25 @@ import time
 from typing import List, Optional
 
 
+class TmuxError(Exception):
+    """tmux 命令超时没有响应。"""
+
+
 class Tmux:
-    def __init__(self, socket: Optional[str] = None):
+    def __init__(self, socket: Optional[str] = None, timeout: float = 15, binary: str = "tmux"):
         # socket 即 `tmux -L <name>`，用于测试时隔离出独立的 tmux server
-        self.base = ["tmux"] + (["-L", socket] if socket else [])
+        self.base = [binary] + (["-L", socket] if socket else [])
+        self.timeout = timeout  # 每次调用 tmux / pgrep 的超时秒数；曾出现 send-keys 卡住 17 小时，不设超时监控会无声冻结
+
+    def _call(self, cmd: List[str]) -> subprocess.CompletedProcess:
+        try:
+            # stdin 接 /dev/null：避免子进程继承监控进程所在的终端；超时后 run 会杀掉子进程
+            return subprocess.run(cmd, capture_output=True, text=True, stdin=subprocess.DEVNULL, timeout=self.timeout)
+        except subprocess.TimeoutExpired:
+            raise TmuxError(f"`{' '.join(cmd[:4])}` did not respond within {self.timeout:g}s")
 
     def _run(self, *args: str) -> subprocess.CompletedProcess:
-        return subprocess.run(self.base + list(args), capture_output=True, text=True)
+        return self._call(self.base + list(args))
 
     @staticmethod
     def target(name: str) -> str:
@@ -23,10 +35,9 @@ class Tmux:
         out = r.stdout.strip()
         return int(out) if r.returncode == 0 and out.isdigit() else None
 
-    @staticmethod
-    def busy(pane_pid: int) -> bool:
+    def busy(self, pane_pid: int) -> bool:
         """pane 的 shell 下是否有子进程，即前台是否有命令在跑。"""
-        return subprocess.run(["pgrep", "-P", str(pane_pid)], capture_output=True).returncode == 0
+        return self._call(["pgrep", "-P", str(pane_pid)]).returncode == 0
 
     def wait_idle(self, pane_pid: int, timeout: float) -> bool:
         end = time.time() + timeout

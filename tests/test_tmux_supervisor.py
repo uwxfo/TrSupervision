@@ -13,7 +13,7 @@ from pathlib import Path
 from tmux_supervisor.supervisor import (AlreadyRunning, MonitorStop, Supervisor, acquire_lock,
                                         find_checkpoint, running_monitors, with_resume)
 from tmux_supervisor.tasks import load_windows, move_task, parse_task
-from tmux_supervisor.tmuxctl import Tmux
+from tmux_supervisor.tmuxctl import Tmux, TmuxError
 
 ROOT = Path(__file__).resolve().parent.parent
 
@@ -138,7 +138,43 @@ class LockTest(unittest.TestCase):
         self.assertEqual(running_monitors(state), {})  # 进程/句柄结束后锁自动释放
 
 
-class TmuxCase(unittest.TestCase):
+class TmuxTimeoutTest(unittest.TestCase):
+    """tmux 命令卡住（曾有 send-keys 卡 17 小时）时，监控不能跟着无声冻结。"""
+
+    def setUp(self):
+        self.dir = Path(tempfile.mkdtemp())
+        fake = self.dir / "fake-tmux"
+        fake.write_text("#!/bin/sh\nsleep 30\n")
+        fake.chmod(0o755)
+        self.tm = Tmux(binary=str(fake), timeout=1)
+        (self.dir / "task.md").write_text(f"# tmux: w1\nworkdir: {self.dir}\n## task-list\necho hi\n")
+        self.out = []
+        self.sup = Supervisor(self.dir / "task.md", self.dir / "state", self.dir / "logs", self.tm, "w1",
+                              echo=self.out.append)
+
+    def test_hung_tmux_raises_tmux_error_quickly(self):
+        t0 = time.time()
+        with self.assertRaises(TmuxError):
+            self.tm.pane_pid("w1")
+        self.assertLess(time.time() - t0, 5)
+
+    def test_check_stops_monitor_when_tmux_does_not_respond(self):
+        with self.assertRaises(MonitorStop) as cm:
+            self.sup.check()
+        self.assertIn("not respond", cm.exception.reason)
+
+    def test_loop_returns_1_when_tmux_does_not_respond(self):
+        self.assertEqual(self.sup.run_forever(interval=600, poll=0.2), 1)
+        self.assertIn("not respond", "\n".join(self.out))
+
+
+class SocketCleanupMixin:
+    def kill_tmux(self):
+        subprocess.run(["tmux", "-L", self.sock, "kill-server"], capture_output=True)
+        Path(f"/tmp/tmux-{os.getuid()}/{self.sock}").unlink(missing_ok=True)  # kill-server 不删 socket 文件
+
+
+class TmuxCase(SocketCleanupMixin, unittest.TestCase):
     """用独立 socket 的真实 tmux server 跑端到端流程；每个测试独立 server，避免 kill-server 后立即复用 socket 的竞态。"""
 
     def setUp(self):
@@ -147,7 +183,7 @@ class TmuxCase(unittest.TestCase):
         self.dir = Path(tempfile.mkdtemp())
         self.out = []  # 监控程序打印到终端的内容
         subprocess.run(["tmux", "-L", self.sock, "new-session", "-d", "-s", "w1", "-x", "200", "bash", "--norc"], check=True)
-        self.addCleanup(lambda: subprocess.run(["tmux", "-L", self.sock, "kill-server"], capture_output=True))
+        self.addCleanup(self.kill_tmux)
         self.sup = self.make()
 
     def make(self, **kw):
@@ -213,10 +249,18 @@ class QueueTest(TmuxCase):
         self.assertEqual((self.dir / "out").read_text().split(),
                          [str((self.dir / "sub").resolve()), str(self.dir.resolve())])
 
-    def test_empty_queue_is_idle_not_stopped(self):
+    def test_empty_queue_finishes_monitor(self):
         self.write_tasks("## task-list\n")
         self.sup.check()
-        self.assertEqual(self.sup.load_state()["status"], "idle")
+        self.assertTrue(self.sup.finished)
+        self.assertIn("all tasks finished", self.text())
+
+    def test_not_finished_while_a_task_is_still_running(self):
+        self.write_tasks("## task-list\nsleep 3\n")
+        self.sup.check()
+        self.assertFalse(self.sup.finished)  # 最后一条在运行时队列虽然还有它自己，但绝不能提前判定完成
+        self.drive(lambda: self.sup.finished)
+        self.assertEqual(self.win().tasks, [])
 
 
 class RetryTest(TmuxCase):
@@ -389,18 +433,36 @@ class RunLoopTest(TmuxCase):
         self.assertEqual(result, [1])
         self.assertIn("no exit record", self.text())
 
+    def test_loop_exits_0_when_all_tasks_are_done(self):
+        # 成功 -> 自动跑下一条 -> 队列跑空 -> 监控自己退出（退出码 0）；interval 很长，说明不是靠周期检查
+        self.write_tasks("## task-list\necho A >> out\necho B >> out\n")
+        self.assertEqual(self.sup.run_forever(interval=600, poll=0.2), 0)
+        self.assertEqual((self.dir / "out").read_text().split(), ["A", "B"])
+        self.assertEqual(len(self.win().worked), 2)
+        self.assertIn("all tasks finished", self.text())
+
+    def test_loop_exits_0_when_queue_ends_with_failures_and_reports_them(self):
+        self.sup = self.make(max_retries=0)
+        self.write_tasks("## task-list\nbash -c 'exit 3'\necho ok >> out\n")
+        self.assertEqual(self.sup.run_forever(interval=600, poll=0.2), 0)
+        self.assertIn("failed list: 1", self.text())
+
+    def test_loop_exits_immediately_when_queue_is_empty_at_start(self):
+        self.write_tasks("## task-list\n")
+        self.assertEqual(self.sup.run_forever(interval=600, poll=0.2), 0)
+
     def test_loop_returns_1_on_auto_stop(self):
         self.write_tasks("## task-list\nbash -c 'exit 120'\n")
         self.assertEqual(self.sup.run_forever(interval=600, poll=0.2), 1)
         self.assertIn("120", self.text())
 
 
-class CliTest(unittest.TestCase):
+class CliTest(SocketCleanupMixin, unittest.TestCase):
     def setUp(self):
         self.sock = f"tmuxsup-cli-{os.getpid()}-{time.time_ns()}"
         self.dir = Path(tempfile.mkdtemp())
         subprocess.run(["tmux", "-L", self.sock, "new-session", "-d", "-s", "w1", "bash", "--norc"], check=True)
-        self.addCleanup(lambda: subprocess.run(["tmux", "-L", self.sock, "kill-server"], capture_output=True))
+        self.addCleanup(self.kill_tmux)
         (self.dir / "task.md").write_text(f"# tmux: w1\nworkdir: {self.dir}\n## task-list\nsleep 60\n")
         self.common = ["--task-file", str(self.dir / "task.md"), "--state-dir", str(self.dir / "state"),
                        "--log-dir", str(self.dir / "logs"), "--socket", self.sock]
@@ -441,6 +503,15 @@ class CliTest(unittest.TestCase):
         self.cli("once", "w1", *self.common)  # 启动 sleep 60 后监控就退出了，状态文件里仍记着 running
         r = self.cli("status", "w1", *self.common)
         self.assertIn("last recorded", r.stdout)  # 提示这是监控退出前最后记录的状态，不是实时的
+
+    def test_run_exits_0_by_itself_after_the_queue_drains(self):
+        (self.dir / "task.md").write_text(
+            f"# tmux: w1\nworkdir: {self.dir}\n## task-list\necho a >> {self.dir}/out\necho b >> {self.dir}/out\n")
+        r = self.cli("run", "w1", "--interval", "600", "--poll", "0.3", *self.common)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertEqual((self.dir / "out").read_text().split(), ["a", "b"])  # 第一条成功后自动跑了第二条
+        self.assertIn("all tasks finished", r.stdout)
+        self.assertEqual(running_monitors(self.dir / "state"), {})
 
     def test_stop_when_not_running(self):
         r = self.cli("stop", "w1", "--state-dir", str(self.dir / "state"))

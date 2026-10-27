@@ -16,7 +16,7 @@ from pathlib import Path
 from typing import Dict, List, Optional
 
 from .tasks import Window, load_windows, move_task, parse_task
-from .tmuxctl import Tmux
+from .tmuxctl import Tmux, TmuxError
 
 # 只匹配 CUDA 显存不足；"illegal memory access" 之类不是 OOM，减小 batch 没用。
 OOM_RE = re.compile(r"CUDA out of memory|CUDA error:.*out of memory|CUBLAS_STATUS_ALLOC_FAILED"
@@ -108,6 +108,7 @@ class Supervisor:
         self.max_retries, self.retry_delay, self.auto_resume = max_retries, retry_delay, auto_resume
         self.start_grace, self.echo = start_grace, echo
         self._stop = False
+        self.finished = False  # 队列跑空且没有任务在运行：监控完成使命，run_forever 据此退出
         self.state_dir.mkdir(parents=True, exist_ok=True)
         self.log_dir.mkdir(parents=True, exist_ok=True)
 
@@ -156,8 +157,11 @@ class Supervisor:
             return False
         if Path(st["exit_file"]).exists():
             return True
-        pid = self.tmux.pane_pid(self.name)
-        return pid is not None and not self.tmux.busy(pid)
+        try:
+            pid = self.tmux.pane_pid(self.name)
+            return pid is not None and not self.tmux.busy(pid)
+        except TmuxError as e:
+            raise MonitorStop(f"tmux did not respond: {e}")
 
     def _window(self) -> Window:
         w = load_windows(self.task_file).get(self.name)
@@ -167,6 +171,12 @@ class Supervisor:
 
     def check(self) -> None:
         """检查一次；遇到无法自动处理的情况抛出 MonitorStop。"""
+        try:
+            self._check()
+        except TmuxError as e:  # tmux 卡住：不再继续，免得监控无声冻结
+            raise MonitorStop(f"tmux did not respond: {e}")
+
+    def _check(self) -> None:
         try:
             w = self._window()
         except (OSError, ValueError) as e:
@@ -290,10 +300,10 @@ class Supervisor:
     def _start_next(self, w: Window, st: dict) -> None:
         while True:
             if not w.tasks:
-                if st.get("reason") != "queue empty":
-                    self.event("queue empty; waiting for new tasks")
                 st.update(status="idle", reason="queue empty")
                 self._save(st)
+                self.finished = True
+                self.event(f"all tasks finished (worked list: {len(w.worked)}, failed list: {len(w.failed)}); monitor exits")
                 return
             raw = w.tasks[0]
             cmd, workdir = parse_task(raw, w.workdir)
@@ -351,7 +361,7 @@ class Supervisor:
     def run_forever(self, interval: float, poll: float = 2.0) -> int:
         """每 interval 秒全量检查一次；其间每 poll 秒看一眼有没有任务刚结束，有就立即处理。
 
-        返回退出码：0 = 被 stop / Ctrl-C 正常结束；1 = 因无法自动处理的情况自动结束。
+        返回退出码：0 = 队列跑空 / 被 stop / Ctrl-C 正常结束；1 = 因无法自动处理的情况自动结束。
         """
         next_full = 0.0
         try:
@@ -364,6 +374,8 @@ class Supervisor:
                         self.check()
                     except (OSError, ValueError) as e:
                         self.event(f"error: {e}")
+                    if self.finished:
+                        return 0
                 self._sleep(poll)
         except MonitorStop as e:
             self.event(f"monitor ended: {e.reason}")

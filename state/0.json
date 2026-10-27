@@ -1,11 +1,13 @@
 {
  "status": "running",
- "run_id": "1793005487300068674",
- "attempts": 1,
- "last_check": "2026-10-26T09:04:37",
+ "run_id": "1793067060315110725",
+ "attempts": 0,
+ "last_check": "2026-10-27T06:34:18",
+ "raw": "bash train_detant_vidhoi.sh",
+ "workdir": "/home/yluo/RLIPVISTR",
  "reason": null,
  "command": "bash train_detant_vidhoi.sh",
- "log": "/home/yluo/RLIPVISTR/tmux_supervisor/logs/0-1793005487300068674.log",
- "exit_file": "/home/yluo/RLIPVISTR/tmux_supervisor/state/0.1793005487300068674.exit",
- "started_at": 1793005487.3001266
+ "log": "/home/yluo/RLIPVISTR/tmux_supervisor/logs/0-1793067060315110725.log",
+ "exit_file": "/home/yluo/RLIPVISTR/tmux_supervisor/state/0.1793067060315110725.exit",
+ "started_at": 1793067060.3151517
 }

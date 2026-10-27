@@ -69,6 +69,13 @@ The tool decides from that file and never parses the screen:
   script's default (argparse keeps the last one).
 - Only CUDA out of memory and CUBLAS/CUDNN ALLOC_FAILED count as OOM; "illegal memory access" does not, because a smaller batch would not help.
 
+## When the whole queue is done, the monitor exits
+When a command succeeds (or fails for good) and `task-list` has nothing left, the monitor prints
+`all tasks finished (worked list: N, failed list: M); monitor exits` and **exits with code 0**. Entries in the failed list do not change the exit code,
+so check the printed counts. If `task-list` is already empty at `run`, it exits immediately.
+**So add every task you want to run to `task-list` before the last one finishes**; once the monitor has exited, start it again with `run`.
+While a command that the tool did not start is still running in the window, the monitor waits and does not exit.
+
 ## Automatic end of monitoring (there is no paused state and no resume command)
 In the following cases the situation cannot be handled safely, so the monitor **prints the reason to the terminal and exits with code 1**.
 The task stays on the first line of `task-list`:
@@ -77,6 +84,7 @@ The task stays on the first line of `task-list`:
 - The window is idle but there is no exit record (the process was killed or the terminal was closed). There is no record to read in this case, so the
   monitor notices it in its polling loop (`--poll`), after a 15 s start grace period. It ends within about 15 s and does not wait for `--interval`.
 - The tmux window does not exist or was closed while running, or `task.md` no longer has a queue for that window.
+- tmux does not respond: every `tmux` / `pgrep` call has a 15 s timeout, so a hung call can no longer freeze the monitor silently; on a timeout it exits with the reason `tmux did not respond`.
 
 After you have dealt with the problem, run `./tmuxsup run <window>` again. It restarts from the first line of `task-list`.
 Ending the monitor with `stop` or Ctrl-C exits with code 0.
