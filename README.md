@@ -30,7 +30,7 @@ bash train_a.sh --batch_size 8
 ```
 - **A whole line starting with `#` is a comment and is not executed.** To enable a commented-out command, remove the leading `# `.
 - **A running command stays on the first line of `task-list` until it succeeds**, then moves to `worked list`. It moves to
-  `failed list` only after retries are exhausted or on a shell syntax error. A manually interrupted task goes to neither list; it stays in `task-list`.
+  `failed list` only after retries are exhausted or on a shell syntax error. A manually interrupted task also moves to `failed list` (reason `manually interrupted ...`) and the next command starts.
 - **Working directory**: `[workdir=path]` applies to that one command only (a relative path is relative to the window's `workdir`);
   **the following tasks are not affected** and keep using the window's `workdir`.
 - **Note on a worked entry**: `bash a.sh  # [done log=/path/logs/1-123.log output_dir=/path/output/run_0425]`.
@@ -50,7 +50,8 @@ tmux does not expose the exit code of a command, so the tool wraps every command
 The tool decides from that file and never parses the screen:
 - Exit code 0 -> success: the command moves to the worked list and the next queued command starts.
 - Any other non-zero code -> failure: retry (see below).
-- 120 / 130 / 143, or the window is idle with no exit record -> treated as a **manual interruption**, see below.
+- 130 / 143, 120 with `KeyboardInterrupt` in the log, or the window is idle with no exit record -> a **manual interruption**: moved to `failed list`, the next command starts (no retry).
+- Any other 120 (for example a full disk) is an ordinary error and is retried.
 
 ## Retry rules
 - If the end of the log contains a CUDA OOM, the `--batch_size N` (or `--batch_size=N`) in the command is halved and the command is retried
@@ -77,20 +78,21 @@ so check the printed counts. If `task-list` is already empty at `run`, it exits 
 While a command that the tool did not start is still running in the window, the monitor waits and does not exit.
 
 ## Automatic end of monitoring (there is no paused state and no resume command)
-In the following cases the situation cannot be handled safely, so the monitor **prints the reason to the terminal and exits with code 1**.
-The task stays on the first line of `task-list`:
-- The task exited with 130 / 143 (Ctrl-C / terminate) or **120** (Python failed to flush its output: common when Ctrl-C passes through `tee`, but
-  it can also happen when the disk is full).
-- The window is idle but there is no exit record (the process was killed or the terminal was closed). There is no record to read in this case, so the
-  monitor notices it in its polling loop (`--poll`), after a 15 s start grace period. It ends within about 15 s and does not wait for `--interval`.
+In the following cases it cannot go on, so the monitor **prints the reason to the terminal and exits with code 1**.
+The task stays on the first line of `task-list`.
+A manual interruption (Ctrl-C, process killed, terminal closed) is **not** one of them: the task moves to `failed list` and the next command starts;
+to stop the whole queue use `./tmuxsup stop <window>`. For the "idle with no exit record" kind of interruption, the monitor notices it in its
+polling loop (`--poll`) after a 15 s start grace period, without waiting for `--interval`.
 - The tmux window does not exist or was closed while running, or `task.md` no longer has a queue for that window.
 - tmux does not respond: every `tmux` / `pgrep` call has a 15 s timeout, so a hung call can no longer freeze the monitor silently; on a timeout it exits with the reason `tmux did not respond`.
 
 After you have dealt with the problem, run `./tmuxsup run <window>` again. It restarts from the first line of `task-list`.
 Ending the monitor with `stop` or Ctrl-C exits with code 0.
 
-## Behaviour of a new `run`: a new monitoring session, no inherited state
-`run` clears the window's previous state when it starts. Therefore:
+## Ctrl-C vs `stop`, and what the next `run` does
+- **Ctrl-C on the monitor** is a temporary leave: its state is kept. The next `run` picks up the task still running in the window (or handles its result
+  if it finished meanwhile), so nothing is started twice and nothing is treated as an external command. A killed monitor or a closed terminal behaves the same.
+- **`stop`**, the queue draining, and the automatic-end cases clear the state, so the next `run` is a fresh monitoring session:
 - Any command already running in the window (including one started by the previous monitor that is still running) is treated as an **external command**:
   a notice is printed, the monitor waits for it to finish and **does not retry it**.
 - **Beware of duplicate runs**: if you `stop` the monitor while task T is running, T is still on the first line of `task-list`, and after T finishes the new

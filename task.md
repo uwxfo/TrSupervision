@@ -2,7 +2,7 @@
 workdir: /home/yluo/RLIPVISTR
 
 ## task-list
-bash train_detant_vidhoi.sh
+MASTER_PORT=29502 bash train_detant_vidhoi.sh
 
 ## worked list
 

@@ -111,7 +111,6 @@ def main(argv=None) -> int:
             return 1
         return 0
 
-    sup.reset()  # 新的监控不继承旧状态
     signal.signal(signal.SIGTERM, lambda *_: sup.request_stop())  # `tmuxsup stop` 发来的
     print(f"Monitoring window {a.window}: interval {a.interval:g}s, max retries {a.max_retries}, queue {a.task_file}", flush=True)
     code = sup.run_forever(a.interval, a.poll)

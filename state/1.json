@@ -1,13 +1,6 @@
 {
- "status": "running",
- "run_id": "1793088379898390743",
+ "status": "external",
+ "run_id": null,
  "attempts": 0,
- "last_check": "2026-10-27T10:46:48",
- "raw": "[workdir=/home/yluo/RLIPVISTR-1] bash train_detant_vidhoi.sh",
- "workdir": "/home/yluo/RLIPVISTR-1",
- "reason": null,
- "command": "bash train_detant_vidhoi.sh",
- "log": "/home/yluo/RLIPVISTR/tmux_supervisor/logs/1-1793088379898390743.log",
- "exit_file": "/home/yluo/RLIPVISTR/tmux_supervisor/state/1.1793088379898390743.exit",
- "started_at": 1793088379.898464
+ "last_check": "2026-10-27T12:44:00"
 }

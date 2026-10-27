@@ -130,3 +130,5 @@
 2026-10-27T06:34:18 [0] monitor ended: the window is idle but there is no exit record (process killed or terminal closed); the task stays in task-list: bash train_detant_vidhoi.sh
 2026-10-27T08:05:39 [1] monitor ended: the window is idle but there is no exit record (process killed or terminal closed); the task stays in task-list: bash train_detant_vidhoi.sh
 2026-10-27T08:06:19 [1] start: bash train_detant_vidhoi.sh
+2026-10-27T12:18:43 [1] received Ctrl-C; monitor ended (tasks in tmux are not affected)
+2026-10-27T12:18:58 [1] a command not started by this tool is running in the window; waiting for it to finish (it will not be retried)

@@ -1,4 +1,5 @@
 import os
+from unittest import mock
 import re
 import signal
 import subprocess
@@ -340,39 +341,52 @@ class ResumeTest(TmuxCase):
         self.assertEqual((self.dir / "seen").read_text().strip(), "args:")
 
 
-class AutoStopTest(TmuxCase):
-    """手动退出等无法判断的情况：监控自动结束（MonitorStop），任务留在 task-list 首行。"""
+class ManualInterruptTest(TmuxCase):
+    """手动退出：任务移入 failed list 并继续下一条；只有窗口丢失这类无法继续的情况才结束监控（见 AutoStopTest）。"""
 
-    def assert_stopped_with_task_kept(self, e, reason_part):
-        self.assertIn(reason_part, e.reason)
-        self.assertEqual(self.win().tasks[0], self.task)
-        self.assertEqual((self.win().worked, self.win().failed), ([], []))
+    def assert_failed_then_next(self, reason_part):
+        self.drive(lambda: len(self.win().worked) == 1)  # 下一条已启动并成功
+        self.assertTrue((self.dir / "next").exists())
+        self.assertEqual(self.win().tasks, [])
+        self.assertEqual(len(self.win().worked), 1)
+        self.assertEqual(len(self.win().failed), 1)
+        self.assertIn(reason_part, self.win().failed[0])
 
-    def test_ctrl_c_stops_monitor(self):
-        self.task = "sleep 60"
-        self.write_tasks(f"## task-list\n{self.task}\n")
+    def test_ctrl_c_moves_task_to_failed_and_runs_next(self):
+        self.write_tasks("## task-list\nsleep 60\necho x > next\n")
         self.sup.check()
         time.sleep(1)
         subprocess.run(["tmux", "-L", self.sock, "send-keys", "-t", "=w1:", "C-c"], check=True)
-        e = self.drive_until_stop()
-        # Ctrl-C 的表现不固定：退出码 130/120，或子 shell 一并被中断而没有退出记录
-        self.assertTrue(any(k in e.reason for k in ("interrupted manually", "no exit record")), e.reason)
-        self.assertEqual(self.win().tasks[0], self.task)
-        self.assertEqual((self.win().worked, self.win().failed), ([], []))
+        self.assert_failed_then_next("manually interrupted")
 
-    def test_exit_code_120_stops_monitor(self):
-        self.task = "bash -c 'exit 120'"
-        self.write_tasks(f"## task-list\n{self.task}\n")
-        self.assert_stopped_with_task_kept(self.drive_until_stop(), "120")
+    def test_exit_code_130(self):
+        self.write_tasks("## task-list\nbash -c 'exit 130'\necho x > next\n")
+        self.assert_failed_then_next("exit code 130")
 
-    def test_idle_window_without_exit_record_stops_monitor(self):
-        self.task = "sleep 60"
-        self.write_tasks(f"## task-list\n{self.task}\n")
+    def test_exit_code_143(self):
+        self.write_tasks("## task-list\nbash -c 'exit 143'\necho x > next\n")
+        self.assert_failed_then_next("exit code 143")
+
+    def test_120_with_keyboard_interrupt_in_log_counts_as_manual(self):
+        self.write_tasks("## task-list\nbash -c 'echo KeyboardInterrupt >&2; exit 120'\necho x > next\n")
+        self.assert_failed_then_next("exit code 120")
+
+    def test_120_without_keyboard_interrupt_is_retried(self):
+        self.sup = self.make(max_retries=1)
+        self.write_tasks("## task-list\nbash -c 'exit 120'\necho x > next\n")
+        self.assert_failed_then_next("exceeded max_retries=1 (exit code 120)")
+        self.assertIn("retrying unchanged", self.text())
+
+    def test_idle_window_without_exit_record_moves_task_to_failed_and_runs_next(self):
+        self.write_tasks("## task-list\nsleep 60\necho x > next\n")
         self.sup.check()
         time.sleep(1)
-        pane = self.tm.pane_pid("w1")
-        subprocess.run(["pkill", "-KILL", "-P", str(pane)])  # 连子 shell 带 tee 一起杀掉，退出记录不会被写出
-        self.assert_stopped_with_task_kept(self.drive_until_stop(), "no exit record")
+        subprocess.run(["pkill", "-KILL", "-P", str(self.tm.pane_pid("w1"))])  # 连子 shell 带 tee 一起杀掉，退出记录不会被写出
+        self.assert_failed_then_next("no exit record")
+
+
+class AutoStopTest(TmuxCase):
+    """窗口丢失等无法继续的情况：监控自动结束（MonitorStop），任务留在 task-list 首行。"""
 
     def test_missing_tmux_window_stops_monitor(self):
         self.write_tasks("## task-list\necho hi\n")
@@ -406,6 +420,31 @@ class StartFreshTest(TmuxCase):
         self.assertEqual(self.sup.load_state()["status"], "external")
 
 
+class CtrlCResumeTest(TmuxCase):
+    """Ctrl-C 监控进程只是暂离：状态保留，重新 run 接着监控；stop 则下次是全新的监控。"""
+
+    def start_then_ctrl_c(self):
+        self.write_tasks("## task-list\nsleep 3; echo A >> out\necho B >> out\n")
+        with mock.patch.object(self.sup, "_sleep", side_effect=KeyboardInterrupt):
+            self.assertEqual(self.sup.run_forever(interval=600, poll=0.2), 0)
+        self.assertTrue(self.sup.load_state()["run_id"])
+
+    def test_rerun_after_ctrl_c_resumes_the_running_task(self):
+        self.start_then_ctrl_c()
+        self.sup = self.make()  # 新的监控进程，沿用同一个状态目录
+        self.assertEqual(self.sup.run_forever(interval=600, poll=0.2), 0)
+        self.assertEqual((self.dir / "out").read_text().split(), ["A", "B"])  # A 只跑了一次
+        self.assertEqual(len(self.win().worked), 2)
+        self.assertNotIn("not started by this tool", self.text())
+
+    def test_stop_clears_state(self):
+        self.write_tasks("## task-list\nsleep 30\n")
+        self.sup.check()
+        self.sup.request_stop()
+        self.sup.run_forever(interval=600, poll=0.2)
+        self.assertIsNone(self.sup.load_state()["run_id"])
+
+
 class RunLoopTest(TmuxCase):
     def test_request_stop_ends_loop_with_code_0(self):
         self.write_tasks("## task-list\nsleep 30\n")
@@ -430,7 +469,7 @@ class RunLoopTest(TmuxCase):
         subprocess.run(["pkill", "-KILL", "-P", str(self.tm.pane_pid("w1"))])
         t.join(15)
         self.assertFalse(t.is_alive(), "监控没有及时发现窗口已空闲")
-        self.assertEqual(result, [1])
+        self.assertEqual(result, [0])  # 任务移入 failed list，队列跑空，监控正常退出
         self.assertIn("no exit record", self.text())
 
     def test_loop_exits_0_when_all_tasks_are_done(self):
@@ -452,9 +491,11 @@ class RunLoopTest(TmuxCase):
         self.assertEqual(self.sup.run_forever(interval=600, poll=0.2), 0)
 
     def test_loop_returns_1_on_auto_stop(self):
-        self.write_tasks("## task-list\nbash -c 'exit 120'\n")
+        self.write_tasks("## task-list\necho hi\n")
+        subprocess.run(["tmux", "-L", self.sock, "new-session", "-d", "-s", "keep", "bash", "--norc"], check=True)
+        subprocess.run(["tmux", "-L", self.sock, "kill-session", "-t", "=w1"], check=True)
         self.assertEqual(self.sup.run_forever(interval=600, poll=0.2), 1)
-        self.assertIn("120", self.text())
+        self.assertIn("does not exist", self.text())
 
 
 class CliTest(SocketCleanupMixin, unittest.TestCase):

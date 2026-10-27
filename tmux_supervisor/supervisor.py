@@ -26,9 +26,11 @@ BATCH_ARG_RE = re.compile(r"(--batch_size[ =])(\d+)")
 # 训练程序启动时会 print(args)，其中的 output_dir 即本次运行实际写 checkpoint 的目录（相对任务的 workdir）
 OUTPUT_DIR_RE = re.compile(r"output_dir='([^']+)'")
 RESUME_ARG_RE = re.compile(r"--resume(?:=|\s+)(?:'[^']*'|\"[^\"]*\"|\S+)")
-# 130/143：Ctrl-C / SIGTERM；120：Python 退出时刷新 stdout 失败，Ctrl-C 经 tee 时常见（也可能是磁盘写满）。
-# 这些都按"手动中断"处理：自动结束监控，任务留在 task-list。
-INTERRUPT_RCS = (120, 130, 143)
+# 130/143：Ctrl-C / SIGTERM，按"手动中断"处理：任务移入 failed list，继续下一条。
+# 120：Python 退出时刷新 stdout 失败，Ctrl-C 经 tee 时常见，但磁盘写满也会出现；
+# 只有日志末尾带 KeyboardInterrupt 才算手动中断，否则当普通错误重试。
+INTERRUPT_RCS = (130, 143)
+INTERRUPT_LOG_RE = re.compile(r"KeyboardInterrupt")
 START_GRACE = 15  # 发出命令后，等多久才允许判定"窗口空闲却没有退出记录"（shell 启动子进程需要时间）
 LOG_TAIL_BYTES = 200_000  # 判断错误类型时只读日志末尾；找 output_dir 时读日志开头同样大小
 
@@ -129,7 +131,7 @@ class Supervisor:
         tmp.replace(self._state_path)
 
     def reset(self) -> None:
-        """新的监控不继承旧状态：删掉状态文件和上次遗留的退出记录。"""
+        """清掉状态文件和遗留的退出记录，下次 run 是全新的监控（stop / 队列跑空 / 自动结束时调用；Ctrl-C 不调用）。"""
         self._state_path.unlink(missing_ok=True)
         for p in self.state_dir.glob(f"{safe(self.name)}.*.exit*"):
             p.unlink(missing_ok=True)
@@ -204,9 +206,8 @@ class Supervisor:
             elif time.time() - st["started_at"] < self.start_grace:
                 self._save(st)
             else:
-                self._save(st)
-                raise MonitorStop(f"the window is idle but there is no exit record (process killed or terminal closed); "
-                                  f"the task stays in task-list: {st['command']}")
+                # 没有退出记录：进程被杀或终端被关，按手动中断处理
+                self._fail(st, "manually interrupted (no exit record: process killed or terminal closed)", log_lines=True)
             return
 
         if self.tmux.busy(pid):
@@ -229,9 +230,8 @@ class Supervisor:
                 self.event("warning: this command is no longer in task-list; not recorded in worked list")
             self._clear_run(st)
             self._start_next(self._window(), st)
-        elif rc in INTERRUPT_RCS:
-            self._clear_run(st)
-            raise MonitorStop(f"task interrupted manually (exit code {rc}); the task stays in task-list: {cmd}")
+        elif rc in INTERRUPT_RCS or (rc == 120 and INTERRUPT_LOG_RE.search(self._log_tail(st["log"]))):
+            self._fail(st, f"manually interrupted (exit code {rc})")
         else:
             self._retry(w, st, rc)
 
@@ -361,7 +361,7 @@ class Supervisor:
     def run_forever(self, interval: float, poll: float = 2.0) -> int:
         """每 interval 秒全量检查一次；其间每 poll 秒看一眼有没有任务刚结束，有就立即处理。
 
-        返回退出码：0 = 队列跑空 / 被 stop / Ctrl-C 正常结束；1 = 因无法自动处理的情况自动结束。
+        返回退出码：0 = 队列跑空 / 被 stop / Ctrl-C（仅 Ctrl-C 保留状态）正常结束；1 = 因无法自动处理的情况自动结束。
         """
         next_full = 0.0
         try:
@@ -375,13 +375,17 @@ class Supervisor:
                     except (OSError, ValueError) as e:
                         self.event(f"error: {e}")
                     if self.finished:
+                        self.reset()
                         return 0
                 self._sleep(poll)
         except MonitorStop as e:
             self.event(f"monitor ended: {e.reason}")
+            self.reset()
             return 1
         except KeyboardInterrupt:
-            self.event("received Ctrl-C; monitor ended (tasks in tmux are not affected)")
+            # Ctrl-C 只是暂离：保留状态文件，重新 run 时接着监控正在跑的任务（不会当成外部命令、也不会重复启动）
+            self.event("received Ctrl-C; monitor ended, state kept: the next `run` resumes monitoring (tasks in tmux are not affected)")
             return 0
         self.event("received stop command; monitor ended (tasks in tmux are not affected)")
+        self.reset()  # stop 才是"结束这次监控"：下次 run 是全新的监控
         return 0
