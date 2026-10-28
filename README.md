@@ -113,7 +113,9 @@ Ending the monitor with `stop` or Ctrl-C exits with code 0.
 ## Ctrl-C vs `stop`, and what the next `run` does
 - **Ctrl-C on the monitor** is a temporary leave: its state is kept. The next `run` picks up the task still running in the window (or handles its result
   if it finished meanwhile), so nothing is started twice and nothing is treated as an external command. A killed monitor or a closed terminal behaves the same.
-- **`stop`**, the queue draining, and the automatic-end cases clear the state, so the next `run` is a fresh monitoring session:
+- **`stop`**, the queue draining, and the automatic-end cases clear the state, so the next `run` is a fresh monitoring session. If no monitor is running
+  any more (it was ended with Ctrl-C, killed, or its terminal closed), `stop` clears the saved state itself and prints `cleared saved state of: ...`
+  (exit code 0; with nothing to clear it prints `No monitor is running` and exits 1), so a following `run` does not resume the old task:
 - Any command already running in the window (including one started by the previous monitor that is still running) is treated as an **external command**:
   a notice is printed, the monitor waits for it to finish and **does not retry it**.
 - **Leftover characters at the prompt** (an unsent half line, a `>` continuation prompt, a Ctrl-R search) would be glued to the command the tool types

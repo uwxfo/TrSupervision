@@ -160,6 +160,16 @@ def acquire_lock(state_dir: Path, name: str):
     return f  # 调用方持有它直到监控结束
 
 
+def clear_state(state_dir: Path, stem: str) -> bool:
+    """删掉 stem（safe(窗口名)）对应的状态文件和遗留的退出记录；返回是否真的删了东西。"""
+    removed = False
+    for p in [Path(state_dir) / f"{stem}.json", *Path(state_dir).glob(f"{stem}.*.exit*")]:
+        if p.exists():
+            p.unlink(missing_ok=True)
+            removed = True
+    return removed
+
+
 def running_monitors(state_dir: Path) -> Dict[str, int]:
     """{窗口名: pid}，只含当前确实持有锁（即正在运行）的监控。"""
     out: Dict[str, int] = {}
@@ -206,9 +216,7 @@ class Supervisor:
 
     def reset(self) -> None:
         """清掉状态文件和遗留的退出记录，下次 run 是全新的监控（stop / 队列跑空 / 自动结束时调用；Ctrl-C 不调用）。"""
-        self._state_path.unlink(missing_ok=True)
-        for p in self.state_dir.glob(f"{safe(self.name)}.*.exit*"):
-            p.unlink(missing_ok=True)
+        clear_state(self.state_dir, safe(self.name))
 
     def event(self, msg: str, extra: List[str] = ()) -> None:
         line = f"{datetime.now().isoformat(timespec='seconds')} [{self.name}] {msg}"

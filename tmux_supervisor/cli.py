@@ -5,7 +5,7 @@ import sys
 import time
 from pathlib import Path
 
-from .supervisor import AlreadyRunning, MonitorStop, Supervisor, acquire_lock, running_monitors
+from .supervisor import AlreadyRunning, MonitorStop, Supervisor, acquire_lock, clear_state, running_monitors, safe
 from .tasks import load_windows
 from .tmuxctl import Tmux
 
@@ -45,9 +45,6 @@ def build_parser() -> argparse.ArgumentParser:
 def stop_monitors(state_dir: Path, window, all_: bool) -> int:
     mons = running_monitors(state_dir)
     targets = mons if all_ else ({window: mons[window]} if window in mons else {})
-    if not targets:
-        print("No monitor is running" + ("" if all_ else f": {window}"), file=sys.stderr)
-        return 0 if all_ else 1
     rc = 0
     for name, pid in targets.items():
         os.kill(pid, signal.SIGTERM)
@@ -58,7 +55,19 @@ def stop_monitors(state_dir: Path, window, all_: bool) -> int:
             print(f"monitor {name} (pid {pid}) did not exit within 15s", file=sys.stderr)
             rc = 1
         else:
-            print(f"stopped monitor {name} (pid {pid})")
+            print(f"stopped monitor {name} (pid {pid})")  # 状态由监控进程退出时自己清掉
+    # stop 的语义是"下次 run 全新开始"。监控早已退出（Ctrl-C、被杀、终端关闭）时没有进程替它清状态，这里补上，
+    # 否则下次 run 会接着旧状态把"已不在跑的任务"当成被中断。仍在运行的监控（没退出的）不碰。
+    alive = running_monitors(state_dir)
+    stems = ([p.stem for p in Path(state_dir).glob("*.json")] if all_ else [safe(window)])
+    cleared = [st for st in stems if st not in {safe(n) for n in alive} and clear_state(state_dir, st)]
+    head = "No monitor is running" + ("" if all_ else f": {window}")
+    if cleared:
+        print(("" if targets else f"{head}; ") + f"cleared saved state of: {', '.join(cleared)}", file=sys.stderr)
+        return rc
+    if not targets:
+        print(head, file=sys.stderr)
+        return 0 if all_ else 1
     return rc
 
 

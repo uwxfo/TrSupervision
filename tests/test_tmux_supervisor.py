@@ -1060,6 +1060,40 @@ class CliTest(SocketCleanupMixin, unittest.TestCase):
         self.assertNotEqual(r.returncode, 0)
         self.assertIn("No monitor is running", r.stdout + r.stderr)
 
+    def leave_stale_state(self):
+        """复现"监控早已退出、状态文件还停在运行中"：once 启动 sleep 60 后监控就退出了，再把任务杀掉让窗口空闲。"""
+        self.cli("once", "w1", *self.common)
+        self.assertTrue((self.dir / "state" / "w1.json").exists())
+        pane = subprocess.run(["tmux", "-L", self.sock, "display-message", "-p", "-t", "=w1:", "#{pane_pid}"],
+                              capture_output=True, text=True).stdout.strip()
+        subprocess.run(["pkill", "-KILL", "-P", pane])
+        time.sleep(0.5)
+
+    def test_stop_without_monitor_still_clears_saved_state(self):
+        self.leave_stale_state()
+        (self.dir / "state" / "w1.123.exit").write_text("0\n")  # 遗留的退出记录也要清掉
+        r = self.cli("stop", "w1", "--state-dir", str(self.dir / "state"))
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertIn("No monitor is running", r.stdout + r.stderr)
+        self.assertIn("cleared", r.stdout + r.stderr)
+        self.assertFalse((self.dir / "state" / "w1.json").exists())
+        self.assertEqual(list((self.dir / "state").glob("w1.*.exit*")), [])
+        r = self.cli("once", "w1", *self.common)  # 全新的监控：直接发命令，而不是接着旧任务
+        self.assertIn("start: sleep 60", r.stdout)
+
+    def test_stop_all_without_monitor_clears_all_saved_states(self):
+        self.leave_stale_state()
+        (self.dir / "state" / "other.json").write_text("{}")
+        r = self.cli("stop", "--all", "--state-dir", str(self.dir / "state"))
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertEqual(list((self.dir / "state").glob("*.json")), [])
+
+    def test_stop_leaves_other_windows_state_alone(self):
+        self.leave_stale_state()
+        r = self.cli("stop", "other", "--state-dir", str(self.dir / "state"))
+        self.assertNotEqual(r.returncode, 0)  # 没有监控也没有状态可清
+        self.assertTrue((self.dir / "state" / "w1.json").exists())
+
     def test_run_unknown_window_in_task_file(self):
         r = self.cli("run", "nope", *self.common)
         self.assertEqual(r.returncode, 2)
