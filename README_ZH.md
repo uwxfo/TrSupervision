@@ -40,18 +40,24 @@ bash train_a.sh --batch_size 8
 ## 判断成败的机制：退出码
 tmux 本身不提供命令的退出码，所以工具启动命令时在外面包了一层，大致是：
 ```
-( cd 工作目录 && bash -c '你的命令'; rc=$?; echo $rc > state/<窗口>.<run_id>.exit ) 2>&1 | tee -a logs/<窗口>-<run_id>.log
+( cd 工作目录 && bash -c '你的命令'; rc=$?; echo $rc > state/<窗口>.<run_id>.exit ) 2>&1 | tee -i -a logs/<窗口>-<run_id>.log
 ```
 `rc=$?` 是命令的真实退出码，写入 `.exit` 文件（先写临时文件再 mv，保证内容完整）。工具据此判断，不解析屏幕输出：
 - 退出码 0 → 成功，移入 worked list，启动队列下一条。
 - 其他非 0 → 失败，进入重试（见下）。
-- 130 / 143、日志里带 `KeyboardInterrupt` 的 120、或窗口已空闲但没有退出记录 → 视为**手动中断**：移入 `failed list`，继续下一条（不重试）。
-- 其他 120（如磁盘写满）按普通错误重试。
+- 130 / 143、退出码非 0 且日志末尾带 `KeyboardInterrupt` 或 torchrun 的 `got signal: 2/15`（torchrun 捕获 Ctrl-C 后以 1 退出）、或窗口已空闲但没有退出记录 → 视为**手动中断**：移入 `failed list`，继续下一条（不重试）。
+- 其余情况（包括 120，如磁盘写满）按普通错误重试。
+- `tee -i` 让 tee 忽略 Ctrl-C。否则 Ctrl-C 会连 tee 一起杀掉，任务最后一次 flush 失败、Python 以 120 退出，真实退出码和最后的日志都会丢失。
 
 ## 重试规则
-- 日志末尾含 CUDA OOM → 把命令里的 `--batch_size N`（或 `--batch_size=N`）减半后重试（最小 1，逐次累计：8→4→2→1），例如 `bash a.sh --batch_size 8`；脚本需把额外参数透传给训练程序。
+- 日志末尾含 CUDA OOM → 把 `batch_size` 减半后重试（最小 1，逐次累计：8→4→2→1）：
+  - 命令里已有 `--batch_size N`（或 `--batch_size=N`），如 `bash a.sh --batch_size 8` → 直接减半这个数；
+  - `batch_size` 只写在脚本里（如 `BATCH_SIZE=${BATCH_SIZE:-4}`）→ 从日志开头 `print(args)` 里读出实际生效的 `batch_size=N`，
+    减半后在命令末尾**追加 `--batch_size <新值>`**（argparse 取最后一个）。
+  - 脚本需把额外参数（`"$@"`）透传给训练程序，且放在自己的 `--batch_size` 之后。若日志里的 `batch_size` 与命令里的 `--batch_size`
+    不一致，说明覆盖没生效，直接移入 `failed list` 并写明原因，不会白白重试。
 - 其余错误（读写错误等）→ 原命令重试。
-- 每次重试前等待 `--retry-delay` 秒。超过 `--max-retries` 次仍失败，或 OOM 时命令里没有可再减小的 `--batch_size`，
+- 每次重试前等待 `--retry-delay` 秒。超过 `--max-retries` 次仍失败，或 OOM 时找不到可再减小的 `--batch_size`，
   把命令移入 `failed list`，在终端打印原因（含日志最后 3 行），**窗口继续跑队列下一条**。
 - 队列首条命令有 shell 语法错误 → 同样移入 `failed list`（原因：shell 语法错误），继续下一条。
 - **自动续训**：重试时（不含队列里的新任务）先从上次运行的日志开头找 `output_dir='...'`（训练程序 `print(args)` 的输出，相对任务的工作目录），

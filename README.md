@@ -44,21 +44,27 @@ bash train_a.sh --batch_size 8
 ## How success or failure is decided: the exit code
 tmux does not expose the exit code of a command, so the tool wraps every command it starts, roughly like this:
 ```
-( cd <workdir> && bash -c '<your command>'; rc=$?; echo $rc > state/<window>.<run_id>.exit ) 2>&1 | tee -a logs/<window>-<run_id>.log
+( cd <workdir> && bash -c '<your command>'; rc=$?; echo $rc > state/<window>.<run_id>.exit ) 2>&1 | tee -i -a logs/<window>-<run_id>.log
 ```
 `rc=$?` is the real exit code of the command; it is written to the `.exit` file (to a temp file first, then `mv`, so the content is always complete).
 The tool decides from that file and never parses the screen:
 - Exit code 0 -> success: the command moves to the worked list and the next queued command starts.
 - Any other non-zero code -> failure: retry (see below).
-- 130 / 143, 120 with `KeyboardInterrupt` in the log, or the window is idle with no exit record -> a **manual interruption**: moved to `failed list`, the next command starts (no retry).
-- Any other 120 (for example a full disk) is an ordinary error and is retried.
+- 130 / 143, a non-zero exit whose log tail contains `KeyboardInterrupt` or torchrun's `got signal: 2/15` (torchrun catches Ctrl-C and exits with 1), or the window is idle with no exit record -> a **manual interruption**: moved to `failed list`, the next command starts (no retry).
+- Anything else (including 120, e.g. a full disk) is an ordinary error and is retried.
+- `tee -i` makes `tee` ignore Ctrl-C. Without it, Ctrl-C also kills `tee`, the task's last flush fails and Python exits with 120, losing the real exit code and the final log lines.
 
 ## Retry rules
-- If the end of the log contains a CUDA OOM, the `--batch_size N` (or `--batch_size=N`) in the command is halved and the command is retried
-  (minimum 1, cumulative: 8 -> 4 -> 2 -> 1), e.g. `bash a.sh --batch_size 8`. The script must pass extra arguments through to the training program.
+- If the end of the log contains a CUDA OOM, `batch_size` is halved and the command is retried (minimum 1, cumulative: 8 -> 4 -> 2 -> 1):
+  - the command already has `--batch_size N` (or `--batch_size=N`), e.g. `bash a.sh --batch_size 8` -> that number is halved;
+  - `batch_size` is only set inside the script (e.g. `BATCH_SIZE=${BATCH_SIZE:-4}`) -> the tool reads the effective `batch_size=N` from the
+    `print(args)` line at the top of the log, halves it and **appends `--batch_size <new>`** to the command (argparse keeps the last one).
+  - The script must pass extra arguments (`"$@"`) through to the training program, after its own `--batch_size`. If the log's `batch_size`
+    differs from the command's `--batch_size`, the override is not applied; the command moves to `failed list` with that reason instead of
+    retrying in vain.
 - Any other error (read/write errors, ...) -> retry the command unchanged.
-- The tool waits `--retry-delay` seconds before each retry. If it still fails after `--max-retries` retries, or on an OOM when the command has no
-  `--batch_size` left to reduce, the command moves to `failed list`, the reason is printed to the terminal (with the last 3 log lines),
+- The tool waits `--retry-delay` seconds before each retry. If it still fails after `--max-retries` retries, or on an OOM when there is no
+  `batch_size` left to reduce, the command moves to `failed list`, the reason is printed to the terminal (with the last 3 log lines),
   and **the window carries on with the next queued command**.
 - A shell syntax error in the first queued command -> it also moves to `failed list` (reason: shell syntax error) and the next command starts.
 - **Auto-resume**: on a retry (not for a new task from the queue), the tool finds `output_dir='...'` at the start of the previous run's log

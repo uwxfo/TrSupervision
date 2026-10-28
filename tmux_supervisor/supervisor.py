@@ -23,14 +23,16 @@ OOM_RE = re.compile(r"CUDA out of memory|CUDA error:.*out of memory|CUBLAS_STATU
                     r"|CUDNN_STATUS_ALLOC_FAILED", re.I)
 # 命令行里的 batch_size 参数（支持 `--batch_size 4` 与 `--batch_size=4`），OOM 重试时改写它
 BATCH_ARG_RE = re.compile(r"(--batch_size[ =])(\d+)")
+# 训练程序启动时 print(args) 里的 batch_size=N，是本次运行实际生效的值（batch_size 写在脚本里时命令行上看不到）
+BATCH_LOG_RE = re.compile(r"\bbatch_size=(\d+)")
 # 训练程序启动时会 print(args)，其中的 output_dir 即本次运行实际写 checkpoint 的目录（相对任务的 workdir）
 OUTPUT_DIR_RE = re.compile(r"output_dir='([^']+)'")
 RESUME_ARG_RE = re.compile(r"--resume(?:=|\s+)(?:'[^']*'|\"[^\"]*\"|\S+)")
 # 130/143：Ctrl-C / SIGTERM，按"手动中断"处理：任务移入 failed list，继续下一条。
-# 120：Python 退出时刷新 stdout 失败，Ctrl-C 经 tee 时常见，但磁盘写满也会出现；
-# 只有日志末尾带 KeyboardInterrupt 才算手动中断，否则当普通错误重试。
+# torchrun 等程序捕获 SIGINT 后会以 1 退出，所以退出码非 0 时还看日志：带 KeyboardInterrupt，
+# 或 torchrun 的 "got signal: 2/15"，也算手动中断。其余错误（含 120）当普通错误重试。
 INTERRUPT_RCS = (130, 143)
-INTERRUPT_LOG_RE = re.compile(r"KeyboardInterrupt")
+INTERRUPT_LOG_RE = re.compile(r"KeyboardInterrupt|SignalException: .*got signal: (?:2|15)\b")
 START_GRACE = 15  # 发出命令后，等多久才允许判定"窗口空闲却没有退出记录"（shell 启动子进程需要时间）
 LOG_TAIL_BYTES = 200_000  # 判断错误类型时只读日志末尾；找 output_dir 时读日志开头同样大小
 
@@ -230,7 +232,7 @@ class Supervisor:
                 self.event("warning: this command is no longer in task-list; not recorded in worked list")
             self._clear_run(st)
             self._start_next(self._window(), st)
-        elif rc in INTERRUPT_RCS or (rc == 120 and INTERRUPT_LOG_RE.search(self._log_tail(st["log"]))):
+        elif rc in INTERRUPT_RCS or INTERRUPT_LOG_RE.search(self._log_tail(st["log"])):
             self._fail(st, f"manually interrupted (exit code {rc})")
         else:
             self._retry(w, st, rc)
@@ -260,13 +262,26 @@ class Supervisor:
         if OOM_RE.search(self._log_tail(st["log"])):
             # 仅 CUDA OOM 才减小 batch_size；其他错误（读写错误等）保持原命令重试
             hits = list(BATCH_ARG_RE.finditer(cmd))
-            if not hits or int(hits[-1].group(2)) <= 1:
-                return self._fail(st, "CUDA OOM and the command has no reducible --batch_size N", log_lines=True)
-            m = hits[-1]  # 多次出现时 argparse 以最后一个为准
-            old = int(m.group(2))
+            m_log = BATCH_LOG_RE.search(self._log_head(st["log"]))
+            log_bs = int(m_log.group(1)) if m_log else None  # 本次运行实际生效的 batch_size
+            if hits:
+                old = int(hits[-1].group(2))  # 多次出现时 argparse 以最后一个为准
+                if log_bs is not None and log_bs != old:
+                    # 命令行上的 --batch_size 没生效（脚本没把额外参数转发给训练程序）：继续减半只会空转
+                    return self._fail(st, f"CUDA OOM, but the log shows batch_size={log_bs} while the command has "
+                                          f"--batch_size {old}: the script does not apply the --batch_size override "
+                                          f"(it must pass extra arguments through)", log_lines=True)
+            else:
+                old = log_bs  # batch_size 写在脚本里：以日志里的实际值为准，减半后追加 --batch_size 覆盖它
+            if old is None or old <= 1:
+                return self._fail(st, "CUDA OOM and no reducible --batch_size (not in the command or the log, or already 1)",
+                                  log_lines=True)
             new = max(1, old // 2)
             self.event(f"CUDA OOM: --batch_size {old} -> {new}")
-            cmd = cmd[:m.start(2)] + str(new) + cmd[m.end(2):]
+            if hits:
+                cmd = cmd[:hits[-1].start(2)] + str(new) + cmd[hits[-1].end(2):]
+            else:
+                cmd = f"{cmd} --batch_size {new}"  # 脚本把 "$@" 追加在自己的 --batch_size 之后，argparse 取最后一个
         else:
             self.event(f"command failed (exit code {rc}); retrying unchanged")
         st["attempts"] += 1
@@ -324,10 +339,12 @@ class Supervisor:
         log = self.log_dir / f"{safe(self.name)}-{run_id}.log"
         exit_file = self.state_dir / f"{safe(self.name)}.{run_id}.exit"
         # 子 shell + `bash -c`：任务里的 exit/cd 不会影响窗口 shell；退出码先写临时文件再 mv，保证读到的是完整内容。
+        # `tee -i` 忽略 SIGINT：Ctrl-C 会发给整个前台进程组，tee 若一并被杀，任务再往管道写就会失败，
+        # Python 退出时 flush 报错得到退出码 120，真实退出码和收尾日志（如 KeyboardInterrupt、OOM）都丢失。
         wrapped = (f"( cd {shlex.quote(st['workdir'])} && bash -c {shlex.quote(run_cmd)}; rc=$?; "
                    f"echo $rc > {shlex.quote(str(exit_file))}.tmp && "
                    f"mv {shlex.quote(str(exit_file))}.tmp {shlex.quote(str(exit_file))}; exit $rc ) "
-                   f"2>&1 | tee -a {shlex.quote(str(log))}")
+                   f"2>&1 | tee -i -a {shlex.quote(str(log))}")
         st.update(status="running", run_id=run_id, command=cmd, log=str(log),
                   exit_file=str(exit_file), started_at=time.time())
         self._save(st)  # 先落盘再发送，进程崩溃重启后仍能接上这次运行

@@ -278,6 +278,43 @@ class RetryTest(TmuxCase):
         self.drive(lambda: (self.dir / "seen").exists() and "ok" in (self.dir / "seen").read_text())
         self.assertEqual((self.dir / "seen").read_text().split(), ["bs=8", "bs=4", "bs=2", "bs=2", "ok"])
 
+    def _argparse_like_script(self, name, ignore_args=False, default_bs=8):
+        """模拟用户的训练脚本：batch_size 默认值写在脚本里，额外参数追加在最后（argparse 以最后一个为准），
+        并像 main.py 一样把 Namespace(batch_size=N) 打到日志。ignore_args=True 模拟不转发 "$@" 的脚本。"""
+        script = self.dir / name
+        script.write_text(
+            f'BATCH_SIZE="${{BATCH_SIZE:-{default_bs}}}"\n'
+            f'args=(--batch_size "$BATCH_SIZE" {"" if ignore_args else '"$@"'})\n'
+            'bs=0; for ((i=0; i<${#args[@]}; i++)); do [ "${args[$i]}" = --batch_size ] && bs=${args[$((i+1))]}; done\n'
+            'echo "Namespace(batch_size=$bs, batch_size_total=8, seed=1)"\n'
+            'echo "bs=$bs" >> seen\n'
+            'if [ "$bs" -gt 2 ]; then echo "RuntimeError: CUDA out of memory." >&2; exit 1; fi\n'
+            'echo ok >> seen\n')
+        return script
+
+    def test_oom_with_batch_size_only_in_script_appends_override(self):
+        script = self._argparse_like_script("t2.sh")
+        self.write_tasks(f"## task-list\nbash {script}\n")  # 任务行里没有 --batch_size，默认值 8 在脚本里
+        self.drive(lambda: (self.dir / "seen").exists() and "ok" in (self.dir / "seen").read_text())
+        self.assertEqual((self.dir / "seen").read_text().split(), ["bs=8", "bs=4", "bs=2", "ok"])
+        self.assertIn("CUDA OOM: --batch_size 8 -> 4", self.text())
+        self.assertEqual(self.win().failed, [])
+
+    def test_oom_when_script_ignores_batch_override_fails_with_reason(self):
+        script = self._argparse_like_script("t3.sh", ignore_args=True)
+        self.write_tasks(f"## task-list\nbash {script}\n")
+        self.drive(lambda: bool(self.win().failed))
+        self.assertEqual((self.dir / "seen").read_text().split(), ["bs=8", "bs=8"])  # 只空转一次就判失败
+        self.assertIn("does not apply the --batch_size override", self.win().failed[0])
+
+    def test_oom_with_batch_size_1_in_log_goes_to_failed_list(self):
+        script = self._argparse_like_script("t4.sh", default_bs=1)
+        script.write_text(script.read_text().replace('-gt 2', '-ge 1'))  # bs=1 也 OOM
+        self.write_tasks(f"## task-list\nbash {script}\n")
+        self.drive(lambda: bool(self.win().failed))
+        self.assertEqual((self.dir / "seen").read_text().split(), ["bs=1"])
+        self.assertIn("no reducible --batch_size", self.win().failed[0])
+
     def test_exhausted_retries_go_to_failed_list_and_queue_continues(self):
         self.sup = self.make(max_retries=1)
         self.write_tasks("## task-list\nbash -c 'echo x >> n; exit 3'\necho next >> n\n")
@@ -344,6 +381,11 @@ class ResumeTest(TmuxCase):
 class ManualInterruptTest(TmuxCase):
     """手动退出：任务移入 failed list 并继续下一条；只有窗口丢失这类无法继续的情况才结束监控（见 AutoStopTest）。"""
 
+    def assert_manual_then_next(self, exit_code):
+        """任务被判为手动中断（而不是重试耗尽后失败）：failed 原因含 manually interrupted，且没有重试过。"""
+        self.assert_failed_then_next(f"manually interrupted (exit code {exit_code})")
+        self.assertNotIn("retry", self.text())
+
     def assert_failed_then_next(self, reason_part):
         self.drive(lambda: len(self.win().worked) == 1)  # 下一条已启动并成功
         self.assertTrue((self.dir / "next").exists())
@@ -351,6 +393,9 @@ class ManualInterruptTest(TmuxCase):
         self.assertEqual(len(self.win().worked), 1)
         self.assertEqual(len(self.win().failed), 1)
         self.assertIn(reason_part, self.win().failed[0])
+
+    def log_text(self):
+        return "".join(p.read_text() for p in (self.dir / "logs").glob("*.log"))
 
     def test_ctrl_c_moves_task_to_failed_and_runs_next(self):
         self.write_tasks("## task-list\nsleep 60\necho x > next\n")
@@ -361,15 +406,47 @@ class ManualInterruptTest(TmuxCase):
 
     def test_exit_code_130(self):
         self.write_tasks("## task-list\nbash -c 'exit 130'\necho x > next\n")
-        self.assert_failed_then_next("exit code 130")
+        self.assert_manual_then_next(130)
 
     def test_exit_code_143(self):
         self.write_tasks("## task-list\nbash -c 'exit 143'\necho x > next\n")
-        self.assert_failed_then_next("exit code 143")
+        self.assert_manual_then_next(143)
+
+    def test_ctrl_c_on_task_that_handles_sigint_is_manual_and_keeps_log(self):
+        # 模拟 torchrun：捕获 SIGINT 后继续打印收尾信息，再以 1 退出。
+        # tee 若被 Ctrl-C 一并杀死，Python 退出时 flush 失败得到 120，且收尾输出（KeyboardInterrupt）丢失，
+        # 任务会被误当普通错误重试；wrapper 里的 tee 必须忽略 SIGINT。
+        script = self.dir / "graceful.py"
+        script.write_text(
+            "import sys, time\n"
+            "print('started', flush=True)\n"
+            "try:\n"
+            "    time.sleep(60)\n"
+            "except KeyboardInterrupt:\n"
+            "    print('KeyboardInterrupt: cleanup')\n"
+            "    sys.exit(1)\n")
+        self.write_tasks(f"## task-list\npython3 {script}\necho x > next\n")
+        self.sup.check()
+        self.drive(lambda: "started" in self.log_text())  # 等脚本装好 SIGINT 处理再发 Ctrl-C
+        subprocess.run(["tmux", "-L", self.sock, "send-keys", "-t", "=w1:", "C-c"], check=True)
+        self.assert_manual_then_next(1)
+        self.assertIn("KeyboardInterrupt: cleanup", self.log_text())
+
+    def test_nonzero_exit_with_keyboard_interrupt_in_log_counts_as_manual(self):
+        self.write_tasks("## task-list\nbash -c 'echo KeyboardInterrupt >&2; exit 1'\necho x > next\n")
+        self.assert_manual_then_next(1)
+
+    def test_torchrun_got_signal_2_in_log_counts_as_manual(self):
+        self.write_tasks("## task-list\nbash -c 'echo SignalException: Process 7 got signal: 2 >&2; exit 1'\necho x > next\n")
+        self.assert_manual_then_next(1)
+
+    def test_torchrun_got_signal_15_in_log_counts_as_manual(self):
+        self.write_tasks("## task-list\nbash -c 'echo SignalException: Process 7 got signal: 15 >&2; exit 1'\necho x > next\n")
+        self.assert_manual_then_next(1)
 
     def test_120_with_keyboard_interrupt_in_log_counts_as_manual(self):
         self.write_tasks("## task-list\nbash -c 'echo KeyboardInterrupt >&2; exit 120'\necho x > next\n")
-        self.assert_failed_then_next("exit code 120")
+        self.assert_manual_then_next(120)
 
     def test_120_without_keyboard_interrupt_is_retried(self):
         self.sup = self.make(max_retries=1)
