@@ -12,7 +12,7 @@ import zipfile
 from pathlib import Path
 
 from tmux_supervisor.supervisor import (AlreadyRunning, MonitorStop, Supervisor, acquire_lock,
-                                        find_checkpoint, running_monitors, with_resume)
+                                        find_checkpoint, halve_batch, running_monitors, with_resume)
 from tmux_supervisor.tasks import load_windows, move_task, parse_task
 from tmux_supervisor.tmuxctl import Tmux, TmuxError
 
@@ -278,6 +278,22 @@ class RetryTest(TmuxCase):
         self.drive(lambda: (self.dir / "seen").exists() and "ok" in (self.dir / "seen").read_text())
         self.assertEqual((self.dir / "seen").read_text().split(), ["bs=8", "bs=4", "bs=2", "bs=2", "ok"])
 
+    def test_oom_scales_accum_factor_to_keep_logical_batch(self):
+        script = self.dir / "t.sh"
+        # 每次运行记录 batch_size 与 --accum_factor（缺省 1）；batch_size>2 时 OOM
+        script.write_text(
+            'BS=$2; F=1\n'
+            'for a in "$@"; do case "$prev" in --accum_factor) F=$a;; esac; prev=$a; done\n'
+            'echo "$((BS*F))" >> seen\n'
+            'if [ "$BS" -gt 2 ]; then echo "RuntimeError: CUDA out of memory." >&2; exit 1; fi\n'
+            'echo ok >> seen\n')
+        self.write_tasks(f"## task-list\nbash {script} --batch_size 8\n")
+        self.drive(lambda: (self.dir / "seen").exists() and "ok" in (self.dir / "seen").read_text())
+        self.assertEqual((self.dir / "seen").read_text().split(), ["8", "8", "8", "ok"])  # 逻辑 batch 始终为 8
+
+    def test_halve_batch_keeps_divisibility(self):
+        self.assertEqual([halve_batch(n) for n in (8, 6, 5, 3, 2, 1)], [4, 3, 1, 1, 1, 1])
+
     def test_exhausted_retries_go_to_failed_list_and_queue_continues(self):
         self.sup = self.make(max_retries=1)
         self.write_tasks("## task-list\nbash -c 'echo x >> n; exit 3'\necho next >> n\n")
@@ -407,6 +423,45 @@ class ExternalCommandTest(TmuxCase):
         self.assertIn("not started by this tool", self.text())
         self.assertFalse((self.dir / "out").exists())
         self.drive(lambda: (self.dir / "out").exists())
+
+
+class NestedShellTest(TmuxCase):
+    """窗口里套了 srun/salloc/ssh 这类转接进程（如 `srun --pty bash` 进计算节点）：看嵌套 shell 的提示符判断忙闲。"""
+
+    def setUp(self):
+        super().setUp()
+        srun = self.dir / "srun"  # 进程名为 srun 的 bash，模拟转接进程
+        srun.write_bytes(Path("/bin/bash").read_bytes())
+        srun.chmod(0o755)
+        self.tm.send("w1", f"PS1='nested$ ' {srun} --norc")
+        time.sleep(1)
+
+    def busy(self):
+        return self.tm.busy(self.tm.pane_pid("w1"), "w1")
+
+    def test_idle_at_prompt_and_busy_while_command_runs(self):
+        self.assertFalse(self.busy())
+        self.tm.send("w1", "sleep 3")
+        time.sleep(0.8)
+        self.assertTrue(self.busy())
+        time.sleep(3)
+        self.assertFalse(self.busy())
+
+    def test_queue_runs_in_nested_shell(self):
+        self.write_tasks("## task-list\necho one\necho two")
+        self.drive(lambda: self.win().worked and len(self.win().worked) == 2, timeout=60)
+
+
+class CopyModeTest(TmuxCase):
+    """用户在窗口里滚动查看历史（copy-mode）时，发送的命令不能被模式吞掉。"""
+
+    def test_send_exits_copy_mode_first(self):
+        subprocess.run(["tmux", "-L", self.sock, "copy-mode", "-t", "=w1:"], check=True)
+        self.tm.send("w1", f"echo ok > {self.dir}/sent")
+        end = time.time() + 5
+        while time.time() < end and not (self.dir / "sent").exists():
+            time.sleep(0.2)
+        self.assertTrue((self.dir / "sent").exists())
 
 
 class StartFreshTest(TmuxCase):

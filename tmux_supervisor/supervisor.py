@@ -23,6 +23,8 @@ OOM_RE = re.compile(r"CUDA out of memory|CUDA error:.*out of memory|CUBLAS_STATU
                     r"|CUDNN_STATUS_ALLOC_FAILED", re.I)
 # 命令行里的 batch_size 参数（支持 `--batch_size 4` 与 `--batch_size=4`），OOM 重试时改写它
 BATCH_ARG_RE = re.compile(r"(--batch_size[ =])(\d+)")
+# batch_size 减小后用 --accum_factor 把梯度累积步数同比放大（训练程序 main.py 识别），保持逻辑 batch 不变
+ACCUM_ARG_RE = re.compile(r"(--accum_factor[ =])(\d+)")
 # 训练程序启动时会 print(args)，其中的 output_dir 即本次运行实际写 checkpoint 的目录（相对任务的 workdir）
 OUTPUT_DIR_RE = re.compile(r"output_dir='([^']+)'")
 RESUME_ARG_RE = re.compile(r"--resume(?:=|\s+)(?:'[^']*'|\"[^\"]*\"|\S+)")
@@ -61,6 +63,18 @@ def find_checkpoint(out_dir: Path) -> Optional[Path]:
     """
     cands = [out_dir / "checkpoint.pth"] + sorted(out_dir.glob("checkpoint[0-9]*.pth"), reverse=True)
     return next((p for p in cands if p.is_file() and zipfile.is_zipfile(p)), None)
+
+
+def halve_batch(old: int) -> int:
+    """OOM 后的新 batch_size：不超过 old//2 的最大约数（偶数就是对半），保证 old 能被它整除，累积倍数才是整数。"""
+    return next(d for d in range(max(1, old // 2), 0, -1) if old % d == 0)
+
+
+def with_accum_factor(cmd: str, factor: int) -> str:
+    """把 `--accum_factor` 设为 factor（已有则替换，没有则追加；脚本把额外参数放在最后，argparse 以后者为准）。"""
+    if ACCUM_ARG_RE.search(cmd):
+        return ACCUM_ARG_RE.sub(lambda m: f"{m.group(1)}{factor}", cmd, count=1)
+    return f"{cmd} --accum_factor {factor}"
 
 
 def with_resume(cmd: str, ckpt: Path) -> str:
@@ -161,7 +175,7 @@ class Supervisor:
             return True
         try:
             pid = self.tmux.pane_pid(self.name)
-            return pid is not None and not self.tmux.busy(pid)
+            return pid is not None and not self.tmux.busy(pid, self.name)
         except TmuxError as e:
             raise MonitorStop(f"tmux did not respond: {e}")
 
@@ -194,13 +208,13 @@ class Supervisor:
             exit_file = Path(st["exit_file"])
             if exit_file.exists():
                 # 退出记录已写入，但 tee 可能还没收尾；等 shell 空闲再动作，否则下一轮再处理
-                if not self.tmux.wait_idle(pid, 10):
+                if not self.tmux.wait_idle(pid, 10, self.name):
                     self._save(st)
                     return
                 rc = int(exit_file.read_text().strip() or 1)
                 exit_file.unlink()
                 self._on_exit(w, st, rc)
-            elif self.tmux.busy(pid):
+            elif self.tmux.busy(pid, self.name):
                 st["status"] = "running"
                 self._save(st)
             elif time.time() - st["started_at"] < self.start_grace:
@@ -210,7 +224,7 @@ class Supervisor:
                 self._fail(st, "manually interrupted (no exit record: process killed or terminal closed)", log_lines=True)
             return
 
-        if self.tmux.busy(pid):
+        if self.tmux.busy(pid, self.name):
             if st["status"] != "external":
                 self.event("a command not started by this tool is running in the window; waiting for it to finish (it will not be retried)")
             st["status"] = "external"
@@ -264,9 +278,13 @@ class Supervisor:
                 return self._fail(st, "CUDA OOM and the command has no reducible --batch_size N", log_lines=True)
             m = hits[-1]  # 多次出现时 argparse 以最后一个为准
             old = int(m.group(2))
-            new = max(1, old // 2)
-            self.event(f"CUDA OOM: --batch_size {old} -> {new}")
+            new = halve_batch(old)
             cmd = cmd[:m.start(2)] + str(new) + cmd[m.end(2):]
+            # batch 缩小 old/new 倍，梯度累积同比放大，逻辑 batch（卡数 x batch x 累积）不变
+            hit = list(ACCUM_ARG_RE.finditer(cmd))
+            factor = (int(hit[-1].group(2)) if hit else 1) * (old // new)
+            cmd = with_accum_factor(cmd, factor)
+            self.event(f"CUDA OOM: --batch_size {old} -> {new}, --accum_factor -> {factor}")
         else:
             self.event(f"command failed (exit code {rc}); retrying unchanged")
         st["attempts"] += 1

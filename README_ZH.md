@@ -50,6 +50,7 @@ tmux 本身不提供命令的退出码，所以工具启动命令时在外面包
 
 ## 重试规则
 - 日志末尾含 CUDA OOM → 把命令里的 `--batch_size N`（或 `--batch_size=N`）减半后重试（最小 1，逐次累计：8→4→2→1），例如 `bash a.sh --batch_size 8`；脚本需把额外参数透传给训练程序。
+  同时在命令里追加/更新 `--accum_factor F`（F = 原 batch_size / 新 batch_size，如 2、4、8），`main.py` 据此把梯度累积步数同比放大，逻辑 batch（卡数 x batch x 累积）保持不变。奇数 batch 会降到不超过一半的最大约数（5→1），保证 F 为整数。
 - 其余错误（读写错误等）→ 原命令重试。
 - 每次重试前等待 `--retry-delay` 秒。超过 `--max-retries` 次仍失败，或 OOM 时命令里没有可再减小的 `--batch_size`，
   把命令移入 `failed list`，在终端打印原因（含日志最后 3 行），**窗口继续跑队列下一条**。

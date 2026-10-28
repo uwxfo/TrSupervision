@@ -56,6 +56,8 @@ The tool decides from that file and never parses the screen:
 ## Retry rules
 - If the end of the log contains a CUDA OOM, the `--batch_size N` (or `--batch_size=N`) in the command is halved and the command is retried
   (minimum 1, cumulative: 8 -> 4 -> 2 -> 1), e.g. `bash a.sh --batch_size 8`. The script must pass extra arguments through to the training program.
+  The same retry also appends/updates `--accum_factor F` (F = original / new batch size, e.g. 2, 4, 8), which `main.py` uses to multiply its gradient
+  accumulation steps, so the logical batch size (GPUs x batch size x accumulation) stays unchanged. An odd batch size drops to its largest divisor not above half (5 -> 1) to keep F an integer.
 - Any other error (read/write errors, ...) -> retry the command unchanged.
 - The tool waits `--retry-delay` seconds before each retry. If it still fails after `--max-retries` retries, or on an OOM when the command has no
   `--batch_size` left to reduce, the command moves to `failed list`, the reason is printed to the terminal (with the last 3 log lines),

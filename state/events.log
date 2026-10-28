@@ -132,3 +132,82 @@
 2026-10-27T08:06:19 [1] start: bash train_detant_vidhoi.sh
 2026-10-27T12:18:43 [1] received Ctrl-C; monitor ended (tasks in tmux are not affected)
 2026-10-27T12:18:58 [1] a command not started by this tool is running in the window; waiting for it to finish (it will not be retried)
+2026-10-27T13:57:08 [run1] a command not started by this tool is running in the window; waiting for it to finish (it will not be retried)
+2026-10-27T14:24:13 [1] monitor ended: the task file has no queue for window 1
+2026-10-27T14:48:17 [run1] received Ctrl-C; monitor ended, state kept: the next `run` resumes monitoring (tasks in tmux are not affected)
+2026-10-27T14:48:57 [run1] start: bash train_detant_vidhoi_sensitivity.sh
+2026-10-27T14:49:12 [run1] FAILED: bash train_detant_vidhoi_sensitivity.sh -> moved to failed list: manually interrupted (no exit record: process killed or terminal closed)
+2026-10-27T14:49:12 [run1] all tasks finished (worked list: 0, failed list: 1); monitor exits
+2026-10-27T18:27:38 [run1] start: bash train_detant_vidhoi_sensitivity.sh
+2026-10-27T18:27:43 [run1] command failed (exit code 127); retrying unchanged
+2026-10-27T18:27:43 [run1] retry 1/3, starting in 10s
+2026-10-27T18:27:53 [run1] no output_dir in the log; cannot locate a checkpoint; retrying unchanged
+2026-10-27T18:27:53 [run1] start: bash train_detant_vidhoi_sensitivity.sh
+2026-10-27T18:27:58 [run1] command failed (exit code 127); retrying unchanged
+2026-10-27T18:27:58 [run1] retry 2/3, starting in 10s
+2026-10-27T18:28:08 [run1] received Ctrl-C; monitor ended, state kept: the next `run` resumes monitoring (tasks in tmux are not affected)
+2026-10-27T18:28:29 [run1] FAILED: bash train_detant_vidhoi_sensitivity.sh -> moved to failed list: manually interrupted (no exit record: process killed or terminal closed)
+    bash: train_detant_vidhoi_sensitivity.sh: No such file or directory
+2026-10-27T18:28:29 [run1] all tasks finished (worked list: 0, failed list: 2); monitor exits
+2026-10-27T18:28:49 [run1] start: bash train_detant_vidhoi_sensitivity.sh
+2026-10-27T18:28:51 [run1] command failed (exit code 127); retrying unchanged
+2026-10-27T18:28:51 [run1] retry 1/3, starting in 10s
+2026-10-27T18:29:01 [run1] no output_dir in the log; cannot locate a checkpoint; retrying unchanged
+2026-10-27T18:29:01 [run1] start: bash train_detant_vidhoi_sensitivity.sh
+2026-10-27T18:29:03 [run1] command failed (exit code 127); retrying unchanged
+2026-10-27T18:29:03 [run1] retry 2/3, starting in 10s
+2026-10-27T18:29:13 [run1] no output_dir in the log; cannot locate a checkpoint; retrying unchanged
+2026-10-27T18:29:13 [run1] start: bash train_detant_vidhoi_sensitivity.sh
+2026-10-27T18:29:16 [run1] command failed (exit code 127); retrying unchanged
+2026-10-27T18:29:16 [run1] retry 3/3, starting in 10s
+2026-10-27T18:29:26 [run1] no output_dir in the log; cannot locate a checkpoint; retrying unchanged
+2026-10-27T18:29:26 [run1] start: bash train_detant_vidhoi_sensitivity.sh
+2026-10-27T18:29:28 [run1] FAILED: bash train_detant_vidhoi_sensitivity.sh -> moved to failed list: exceeded max_retries=3 (exit code 127)
+    bash: train_detant_vidhoi_sensitivity.sh: No such file or directory
+2026-10-27T18:29:28 [run1] all tasks finished (worked list: 0, failed list: 3); monitor exits
+2026-10-27T18:30:32 [run1] all tasks finished (worked list: 1, failed list: 1); monitor exits
+2026-10-27T18:31:00 [run1] start: bash train_detant_vidhoi_sensitivity.sh
+2026-10-27T18:34:17 [run] monitor ended: tmux window run does not exist or was closed
+2026-10-27T18:34:30 [run] monitor ended: tmux window run does not exist or was closed
+2026-10-27T18:34:46 [run] monitor ended: tmux window run does not exist or was closed
+2026-10-27T18:37:12 [run] start: MASTER_PORT=29502 ANTICIPATION_VERB_COEF=1.6 bash train_detant_vidhoi_sensitivity.sh
+2026-10-27T18:37:51 [run] FAILED: MASTER_PORT=29502 ANTICIPATION_VERB_COEF=1.6 bash train_detant_vidhoi_sensitivity.sh -> moved to failed list: manually interrupted (no exit record: process killed or terminal closed)
+2026-10-27T18:38:05 [run] all tasks finished (worked list: 0, failed list: 1); monitor exits
+2026-10-27T18:38:37 [run] start: MASTER_PORT=29502 ANTICIPATION_VERB_COEF=1.6 bash train_detant_vidhoi_sensitivity.sh
+2026-10-28T09:25:30 [run] FAILED: MASTER_PORT=29502 ANTICIPATION_VERB_COEF=1.6 bash train_detant_vidhoi_sensitivity.sh -> moved to failed list: manually interrupted (no exit record: process killed or terminal closed)
+    [rank0] mem epoch=0 iter=2900 input=(12, 3, 432, 768) peak_fwd=6295MiB peak_loss=6295MiB peak_bwd_step=6295MiB reserved=9072MiB
+    [rank0] mem epoch=0 iter=3000 input=(12, 3, 512, 682) peak_fwd=6444MiB peak_loss=6444MiB peak_bwd_step=6444MiB reserved=9072MiB
+    Epoch: [0]  [3000/3785]  eta: 0:04:10  lr: 0.000100  lr_backbone: 0.000010  lr_text_encoder: 0.000005  obj_class_error: 54.41  loss: 18.1912 (22.6195)  loss_horizon_orth: 0.0045 (0.0064)  loss_horizon
+2026-10-28T09:25:30 [run] all tasks finished (worked list: 0, failed list: 2); monitor exits
+2026-10-28T09:35:05 [run1] monitor ended: tmux did not respond: `tmux display-message -p -t` did not respond within 15s
+2026-10-28T09:43:23 [run] all tasks finished (worked list: 1, failed list: 2); monitor exits
+2026-10-28T09:43:29 [run] all tasks finished (worked list: 1, failed list: 2); monitor exits
+2026-10-28T09:45:20 [run] start: MASTER_PORT=29502 ANTICIPATION_VERB_COEF=1.6 ANTICIPATION_HORIZON_GAMMA=0.7 bash train_detant_vidhoi_sensitivity.sh
+2026-10-28T09:45:22 [run] command failed (exit code 1); retrying unchanged
+2026-10-28T09:45:22 [run] retry 1/3, starting in 10s
+2026-10-28T09:45:32 [run] no output_dir in the log; cannot locate a checkpoint; retrying unchanged
+2026-10-28T09:45:32 [run] start: MASTER_PORT=29502 ANTICIPATION_VERB_COEF=1.6 ANTICIPATION_HORIZON_GAMMA=0.7 bash train_detant_vidhoi_sensitivity.sh
+2026-10-28T09:45:35 [run] command failed (exit code 1); retrying unchanged
+2026-10-28T09:45:35 [run] retry 2/3, starting in 10s
+2026-10-28T09:45:45 [run] no output_dir in the log; cannot locate a checkpoint; retrying unchanged
+2026-10-28T09:45:45 [run] start: MASTER_PORT=29502 ANTICIPATION_VERB_COEF=1.6 ANTICIPATION_HORIZON_GAMMA=0.7 bash train_detant_vidhoi_sensitivity.sh
+2026-10-28T09:45:47 [run] command failed (exit code 1); retrying unchanged
+2026-10-28T09:45:47 [run] retry 3/3, starting in 10s
+2026-10-28T09:45:57 [run] no output_dir in the log; cannot locate a checkpoint; retrying unchanged
+2026-10-28T09:45:57 [run] start: MASTER_PORT=29502 ANTICIPATION_VERB_COEF=1.6 ANTICIPATION_HORIZON_GAMMA=0.7 bash train_detant_vidhoi_sensitivity.sh
+2026-10-28T09:45:59 [run] FAILED: MASTER_PORT=29502 ANTICIPATION_VERB_COEF=1.6 ANTICIPATION_HORIZON_GAMMA=0.7 bash train_detant_vidhoi_sensitivity.sh -> moved to failed list: exceeded max_retries=3 (exit code 1)
+    Expected /hkfs/work/workspace/scratch/nj9475-data/images to exist. Current VidHOI loader reads frames from hoi_path/images/...
+2026-10-28T09:45:59 [run] all tasks finished (worked list: 0, failed list: 3); monitor exits
+2026-10-28T09:47:57 [run] start: MASTER_PORT=29502 ANTICIPATION_VERB_COEF=1.6 ANTICIPATION_HORIZON_GAMMA=0.7 bash train_detant_vidhoi_sensitivity.sh --name sensitivity_coef_1.6
+2026-10-28T09:57:34 [run2] start: MASTER_PORT=29502 TASK_ORTH_COEF=0.2 HORIZON_ORTH_COEF=0.2 ACCUM_STEPS=1 bash train_detant_vidhoi_sensitivity.sh --name sensitivity_coef_1.6 --batch_size 4
+2026-10-28T11:19:29 [run] command failed (exit code 120); retrying unchanged
+2026-10-28T11:19:29 [run] retry 1/3, starting in 10s
+2026-10-28T11:19:39 [run] auto-resume: --resume /hkfs/work/workspace/scratch/nj9475-store/RLIPVISTR/output/sensitivity_coef_1.6_10280948/checkpoint.pth
+2026-10-28T11:19:39 [run] start: MASTER_PORT=29502 ANTICIPATION_VERB_COEF=1.6 ANTICIPATION_HORIZON_GAMMA=0.7 bash train_detant_vidhoi_sensitivity.sh --name sensitivity_coef_1.6 --resume /hkfs/work/workspace/scratch/nj9475-store/RLIPVISTR/output/sensitivity_coef_1.6_10280948/checkpoint.pth
+2026-10-28T11:20:37 [run] command failed (exit code 120); retrying unchanged
+2026-10-28T11:20:37 [run] retry 2/3, starting in 10s
+2026-10-28T11:20:47 [run] auto-resume: --resume /hkfs/work/workspace/scratch/nj9475-store/RLIPVISTR/output/sensitivity_coef_1.6_10280948/checkpoint.pth
+2026-10-28T11:20:47 [run] start: MASTER_PORT=29502 ANTICIPATION_VERB_COEF=1.6 ANTICIPATION_HORIZON_GAMMA=0.7 bash train_detant_vidhoi_sensitivity.sh --name sensitivity_coef_1.6 --resume /hkfs/work/workspace/scratch/nj9475-store/RLIPVISTR/output/sensitivity_coef_1.6_10280948/checkpoint.pth
+2026-10-28T11:21:10 [run] FAILED: MASTER_PORT=29502 ANTICIPATION_VERB_COEF=1.6 ANTICIPATION_HORIZON_GAMMA=0.7 bash train_detant_vidhoi_sensitivity.sh --name sensitivity_coef_1.6 -> moved to failed list: manually interrupted (no exit record: process killed or terminal closed)
+2026-10-28T11:21:10 [run] all tasks finished (worked list: 0, failed list: 4); monitor exits
+2026-10-28T11:34:21 [run] start: MASTER_PORT=29502 ANTICIPATION_VERB_COEF=1.6 ANTICIPATION_HORIZON_GAMMA=0.7 bash train_detant_vidhoi_sensitivity.sh --name sensitivity_coef_1.6

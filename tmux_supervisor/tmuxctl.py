@@ -1,7 +1,14 @@
 """对 tmux 命令行的薄封装。"""
+import re
 import subprocess
 import time
 from typing import List, Optional
+
+
+# 这些进程只是把终端转接到别处的 shell（计算节点 / 远程主机），本机看不到里面的子进程
+WRAPPERS = {"srun", "salloc", "ssh"}
+# 光标所在行以 shell 提示符结尾（$ # % >）才算空闲；训练日志一般不会以这些符号结尾
+PROMPT_RE = re.compile(r"[$#%>]\s*$")
 
 
 class TmuxError(Exception):
@@ -35,13 +42,31 @@ class Tmux:
         out = r.stdout.strip()
         return int(out) if r.returncode == 0 and out.isdigit() else None
 
-    def busy(self, pane_pid: int) -> bool:
-        """pane 的 shell 下是否有子进程，即前台是否有命令在跑。"""
-        return self._call(["pgrep", "-P", str(pane_pid)]).returncode == 0
+    def busy(self, pane_pid: int, name: Optional[str] = None) -> bool:
+        """前台是否有命令在跑。
 
-    def wait_idle(self, pane_pid: int, timeout: float) -> bool:
+        pane 的 shell 下有普通子进程即忙。若子进程全是 srun/salloc/ssh 这类转接进程（嵌套 shell，
+        例如 `srun --pty bash` 进计算节点），本机看不到里面是否在跑命令，改看光标所在行是不是 shell 提示符。
+        """
+        r = self._call(["ps", "-o", "comm=", "--ppid", str(pane_pid)])
+        kids = r.stdout.split()
+        if not kids:
+            return False
+        if name is None or any(k not in WRAPPERS for k in kids):
+            return True
+        return not self.at_prompt(name)
+
+    def at_prompt(self, name: str) -> bool:
+        t = self.target(name)
+        y = self._run("display-message", "-p", "-t", t, "#{cursor_y}").stdout.strip()
+        if not y.isdigit():
+            return False
+        line = self._run("capture-pane", "-p", "-t", t, "-S", y, "-E", y).stdout
+        return bool(PROMPT_RE.search(line.rstrip("\n")))
+
+    def wait_idle(self, pane_pid: int, timeout: float, name: Optional[str] = None) -> bool:
         end = time.time() + timeout
-        while self.busy(pane_pid):
+        while self.busy(pane_pid, name):
             if time.time() >= end:
                 return False
             time.sleep(0.2)
@@ -49,6 +74,9 @@ class Tmux:
 
     def send(self, name: str, text: str) -> None:
         t = self.target(name)
+        # 窗口处于 copy-mode（滚动查看历史）时按键会被模式吞掉，命令发不进 shell，先退出该模式
+        if self._run("display-message", "-p", "-t", t, "#{pane_in_mode}").stdout.strip() == "1":
+            self._run("send-keys", "-t", t, "-X", "cancel")
         self._run("send-keys", "-t", t, "-l", "--", text)
         self._run("send-keys", "-t", t, "C-m")
 
