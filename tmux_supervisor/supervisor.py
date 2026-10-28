@@ -235,7 +235,7 @@ class Supervisor:
             return True
         try:
             pid = self.tmux.pane_pid(self.name)
-            return pid is not None and not self.tmux.busy(pid)
+            return pid is not None and not self.tmux.busy(pid, self.name)
         except TmuxError as e:
             raise MonitorStop(f"tmux did not respond: {e}")
 
@@ -268,23 +268,32 @@ class Supervisor:
             exit_file = Path(st["exit_file"])
             if exit_file.exists():
                 # 退出记录已写入，但 tee 可能还没收尾；等 shell 空闲再动作，否则下一轮再处理
-                if not self.tmux.wait_idle(pid, 10):
+                if not self.tmux.wait_idle(pid, 10, self.name):
                     self._save(st)
                     return
                 rc = int(exit_file.read_text().strip() or 1)
                 exit_file.unlink()
                 self._on_exit(w, st, rc)
-            elif self.tmux.busy(pid):
+            elif self.tmux.busy(pid, self.name):
                 st["status"] = "running"
                 self._save(st)
             elif time.time() - st["started_at"] < self.start_grace:
+                self._save(st)
+            elif exit_file.exists():
+                # 上面查退出记录之后、判断空闲之前任务刚好结束：退出记录是先于进程退出写出的，现在再查一次就在了，下一轮按正常结束处理
                 self._save(st)
             else:
                 # 没有退出记录：进程被杀或终端被关，按手动中断处理
                 self._interrupted(st, "manually interrupted (no exit record: process killed or terminal closed)", log_lines=True)
             return
 
-        if self.tmux.busy(pid):
+        if w.tasks and st["status"] != "external" and self.tmux.nested(pid):
+            # 嵌套 shell 里残留文字会让光标行不以提示符结尾，看起来像有程序在跑。要发新命令前先清一次行再判断（只判断这一次）：
+            # 清掉后光标行回到提示符就是空闲；仍然忙说明真有程序在跑，照常等待。
+            # 只在刚进入等待时做一次，不是每个周期都发；C-a C-k 不是信号，不会杀掉程序。
+            self.tmux.clear_line(self.name)
+            time.sleep(0.3)  # 等 shell 重画提示符
+        if self.tmux.busy(pid, self.name):
             if st["status"] != "external":
                 self.event("a command not started by this tool is running in the window; waiting for it to finish (it will not be retried)")
             st["status"] = "external"

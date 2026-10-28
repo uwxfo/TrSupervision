@@ -681,6 +681,26 @@ class InterruptWaitTest(TmuxCase):
         self.assertEqual(len(self.win().failed), 1)
 
 
+class ExitRecordRaceTest(TmuxCase):
+    def test_task_finishing_between_exit_check_and_idle_check_is_not_misjudged_as_interrupted(self):
+        # 监控刚看到"没有退出记录"、还没判断忙闲时，任务恰好写出退出记录并结束：窗口空闲但退出记录已在，不能判成手动中断
+        self.write_tasks("## task-list\nsleep 60\necho x > next\n")
+        self.sup.check()
+        time.sleep(1.2)  # 过了启动宽限期
+        exit_file = Path(self.sup.load_state()["exit_file"])
+        real_busy = self.tm.busy
+
+        def busy_after_task_finished(pid, name=None):
+            exit_file.write_text("0\n")  # 任务在这一瞬间写完退出记录并退出
+            return False
+        self.tm.busy = busy_after_task_finished
+        self.addCleanup(setattr, self.tm, "busy", real_busy)
+        self.sup.check()
+        self.assertNotIn("manually interrupted", self.text())
+        self.assertEqual(self.win().failed, [])
+        self.assertFalse((self.dir / "next").exists())
+
+
 class AutoStopTest(TmuxCase):
     """窗口丢失等无法继续的情况：监控自动结束（MonitorStop），任务留在 task-list 首行。"""
 
@@ -703,6 +723,130 @@ class ExternalCommandTest(TmuxCase):
         self.assertIn("not started by this tool", self.text())
         self.assertFalse((self.dir / "out").exists())
         self.drive(lambda: (self.dir / "out").exists())
+
+    def test_no_keys_sent_to_external_command_in_plain_window(self):
+        self.write_tasks("## task-list\necho queued >> out\n")
+        self.tm.send("w1", "sleep 3")
+        time.sleep(0.5)
+        self.sup.check()
+        text = self.tm._run("capture-pane", "-p", "-t", "=w1:").stdout
+        self.assertNotIn("^A", text)
+        self.assertNotIn("^C", text)
+
+
+class NestedShellTest(TmuxCase):
+    """窗口里套了 srun/salloc/ssh 这类转接进程（如 `srun --pty bash` 进计算节点）：看嵌套 shell 的提示符判断忙闲。"""
+
+    def setUp(self):
+        super().setUp()
+        srun = self.dir / "srun"  # 进程名为 srun 的 bash，模拟转接进程
+        srun.write_bytes(Path("/bin/bash").read_bytes())
+        srun.chmod(0o755)
+        self.tm.send("w1", f"PS1='nested$ ' {srun} --norc")
+        time.sleep(1)
+
+    def busy(self):
+        return self.tm.busy(self.tm.pane_pid("w1"), "w1")
+
+    def type_raw(self, text):
+        self.tm._run("send-keys", "-t", self.tm.target("w1"), "-l", "--", text)
+        time.sleep(0.5)
+
+    def test_idle_at_prompt_and_busy_while_command_runs(self):
+        self.assertFalse(self.busy())
+        self.tm.send("w1", "sleep 3")
+        time.sleep(0.8)
+        self.assertTrue(self.busy())
+        time.sleep(3)
+        self.assertFalse(self.busy())
+
+    def test_queue_runs_in_nested_shell(self):
+        self.write_tasks("## task-list\necho one\necho two")
+        self.drive(lambda: self.win().worked and len(self.win().worked) == 2, timeout=60)
+
+    def test_leftover_ending_with_prompt_char_in_nested_shell_is_cleared(self):
+        self.type_raw("garbage $")  # 光标行仍以提示符字符结尾，被判为空闲；清行用 C-a C-k 而不是 C-c
+        self.write_tasks("## task-list\necho ok >> out\n")
+        self.drive(lambda: (self.dir / "out").exists() and self.sup.load_state()["run_id"] is None)
+        self.assertEqual((self.dir / "out").read_text(), "ok\n")
+        self.assertEqual(self.win().failed, [])
+
+    def pane_text(self):
+        return self.tm._run("capture-pane", "-p", "-t", "=w1:").stdout
+
+    def test_leftover_in_nested_shell_is_cleared_before_launch(self):
+        # 残留文字让光标行不以提示符结尾，看起来像在忙；要发新命令时先 C-a C-k 清一次再重判，清掉后照常启动
+        self.type_raw("garbage")
+        self.write_tasks("## task-list\necho ok >> out\n")
+        self.drive(lambda: (self.dir / "out").exists() and self.sup.load_state()["run_id"] is None)
+        self.assertEqual((self.dir / "out").read_text(), "ok\n")
+        self.assertEqual(self.win().failed, [])
+
+    def test_running_nested_program_is_kept_waiting_and_keys_sent_only_once(self):
+        self.tm.send("w1", f"sleep 6; echo alive > {self.dir}/alive")
+        time.sleep(0.8)
+        self.write_tasks("## task-list\necho ok >> out\n")
+        for _ in range(3):  # 多轮检查：只有刚进入等待那一次会发 C-a C-k
+            self.sup.check()
+            time.sleep(0.3)
+        self.assertEqual(self.sup.load_state()["status"], "external")
+        self.assertEqual(self.pane_text().count("^A^K"), 1)
+        self.assertFalse((self.dir / "out").exists())
+        self.drive(lambda: (self.dir / "out").exists(), timeout=40)  # 程序结束后任务才启动
+        self.assertTrue((self.dir / "alive").exists())  # 程序没被打断
+
+    def test_nothing_is_sent_to_nested_program_when_queue_is_empty(self):
+        self.tm.send("w1", "sleep 3")
+        time.sleep(0.8)
+        self.write_tasks("## task-list\n")
+        self.sup.check()
+        self.assertNotIn("^A", self.pane_text())
+
+    def test_clear_input_sends_nothing_while_nested_command_runs(self):
+        self.tm.send("w1", f"sleep 3; echo alive > {self.dir}/alive")
+        time.sleep(0.8)
+        self.assertFalse(self.tm.clear_input("w1", self.tm.pane_pid("w1")))
+        time.sleep(3.5)
+        self.assertTrue((self.dir / "alive").exists())
+
+    def test_program_misjudged_idle_is_not_killed_by_clear_input(self):
+        # 输出行以 % 结尾（如进度 "45%"）会被当成提示符而误判空闲；这时发出的清行按键不能杀掉程序
+        self.tm.send("w1", f"printf 'progress 45%%'; sleep 3; echo alive > {self.dir}/alive")
+        time.sleep(0.8)
+        self.assertFalse(self.busy())  # 确认确实被误判为空闲
+        self.assertTrue(self.tm.clear_input("w1", self.tm.pane_pid("w1")))
+        time.sleep(3.5)
+        self.assertTrue((self.dir / "alive").exists())
+
+
+class CopyModeTest(TmuxCase):
+    """用户在窗口里滚动查看历史（copy-mode）时，发送的命令不能被模式吞掉。"""
+
+    def enter_copy_mode(self):
+        subprocess.run(["tmux", "-L", self.sock, "copy-mode", "-t", "=w1:"], check=True)
+
+    def in_mode(self):
+        return self.tm._run("display-message", "-p", "-t", "=w1:", "#{pane_in_mode}").stdout.strip() == "1"
+
+    def test_send_exits_copy_mode_first(self):
+        self.enter_copy_mode()
+        self.tm.send("w1", f"echo ok > {self.dir}/sent")
+        end = time.time() + 5
+        while time.time() < end and not (self.dir / "sent").exists():
+            time.sleep(0.2)
+        self.assertTrue((self.dir / "sent").exists())
+
+    def test_clear_input_exits_copy_mode(self):
+        self.enter_copy_mode()
+        self.assertTrue(self.tm.clear_input("w1", self.tm.pane_pid("w1")))
+        self.assertFalse(self.in_mode())
+
+    def test_clear_input_leaves_copy_mode_alone_while_command_runs(self):
+        self.tm.send("w1", "sleep 3")
+        time.sleep(0.5)
+        self.enter_copy_mode()
+        self.assertFalse(self.tm.clear_input("w1", self.tm.pane_pid("w1")))  # 忙碌：什么都不动
+        self.assertTrue(self.in_mode())
 
 
 class DirtyInputTest(TmuxCase):

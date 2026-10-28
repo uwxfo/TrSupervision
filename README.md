@@ -133,6 +133,14 @@ Ending the monitor with `stop` or Ctrl-C exits with code 0.
 ## Notes
 - The window shell must be idle for the tool to start a command. Commands run through `bash -c`, so shell aliases / functions are not available;
   conda environment variables are inherited.
+- **Nested shells**: if the window runs `srun` / `salloc` / `ssh` (for example `srun --pty bash` into a compute node), the local machine cannot see the commands
+  inside, so busy/idle is decided by the cursor line: it counts as idle only when it ends with a prompt character (`$ # % >`). Leftover text would make it
+  look like a running program, so when the tool needs to start a command and the window looks busy, it sends `C-a C-k` (beginning of line + kill to end of line)
+  **once**, waits 0.3 s and judges once more: if the line is clear the command starts, otherwise a program really is running and the tool waits as for any
+  external command (no further keys are sent in that wait). `C-a C-k` is not a signal, so it never kills the program; at worst a few control characters
+  reach its input. It is not sent when the queue is empty. A program whose output line happens to end with a prompt character is still misjudged as idle.
+  A `>` continuation prompt (unclosed quote) cannot be cleared in a nested shell (`C-c` would be needed), unlike in a plain window.
+- **Scrolling (copy-mode)**: if the window is in tmux copy-mode (scrolling through history), the tool leaves that mode before sending keys, so the command is not swallowed.
 - Logs are in `logs/`, events in `state/events.log`.
 
 Tests: `python3 -m unittest discover -s tests -t .`

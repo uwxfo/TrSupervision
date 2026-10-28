@@ -1,7 +1,13 @@
 """对 tmux 命令行的薄封装。"""
+import re
 import subprocess
 import time
 from typing import List, Optional
+
+# 这些进程只是把终端转接到别处的 shell（计算节点 / 远程主机），本机看不到里面的子进程
+WRAPPERS = {"srun", "salloc", "ssh"}
+# 光标所在行以 shell 提示符结尾（$ # % >）才算空闲；训练日志一般不会以这些符号结尾
+PROMPT_RE = re.compile(r"[$#%>]\s*$")
 
 
 class TmuxError(Exception):
@@ -35,30 +41,76 @@ class Tmux:
         out = r.stdout.strip()
         return int(out) if r.returncode == 0 and out.isdigit() else None
 
-    def busy(self, pane_pid: int) -> bool:
-        """pane 的 shell 下是否有子进程，即前台是否有命令在跑。"""
-        return self._call(["pgrep", "-P", str(pane_pid)]).returncode == 0
+    def children(self, pane_pid: int) -> List[str]:
+        """pane 的 shell 下各子进程的进程名（comm）。"""
+        return self._call(["ps", "-o", "comm=", "--ppid", str(pane_pid)]).stdout.split()
 
-    def wait_idle(self, pane_pid: int, timeout: float) -> bool:
+    def busy(self, pane_pid: int, name: Optional[str] = None) -> bool:
+        """前台是否有命令在跑。
+
+        pane 的 shell 下有普通子进程即忙。若子进程全是 srun/salloc/ssh 这类转接进程（嵌套 shell，
+        例如 `srun --pty bash` 进计算节点），本机看不到里面是否在跑命令，改看光标所在行是不是 shell 提示符
+        （需要传窗口名 name；不传则保守地认为忙）。
+        """
+        kids = self.children(pane_pid)
+        if not kids:
+            return False
+        if name is None or any(k not in WRAPPERS for k in kids):
+            return True
+        return not self.at_prompt(name)
+
+    def at_prompt(self, name: str) -> bool:
+        t = self.target(name)
+        y = self._run("display-message", "-p", "-t", t, "#{cursor_y}").stdout.strip()
+        if not y.isdigit():
+            return False
+        line = self._run("capture-pane", "-p", "-t", t, "-S", y, "-E", y).stdout
+        return bool(PROMPT_RE.search(line.rstrip("\n")))
+
+    def wait_idle(self, pane_pid: int, timeout: float, name: Optional[str] = None) -> bool:
         end = time.time() + timeout
-        while self.busy(pane_pid):
+        while self.busy(pane_pid, name):
             if time.time() >= end:
                 return False
             time.sleep(0.2)
         return True
 
+    def _leave_copy_mode(self, t: str) -> None:
+        # 窗口处于 copy-mode（滚动查看历史）时按键会被模式吞掉，命令发不进 shell，先退出该模式
+        if self._run("display-message", "-p", "-t", t, "#{pane_in_mode}").stdout.strip() == "1":
+            self._run("send-keys", "-t", t, "-X", "cancel")
+
     def clear_input(self, name: str, pane_pid: int) -> bool:
         """发命令前清掉 shell 输入行上的残留（没发出的半行、续行提示符 `>`、Ctrl-R 搜索等）：在空闲 shell 里发 C-c 即可全部取消。
 
         C-c 会打断前台程序，所以只在刚确认窗口空闲时才发；有程序在跑时什么也不发并返回 False。
+        嵌套 shell（srun/salloc/ssh）里的"空闲"只是看提示符的推断，程序输出恰好以 $#%> 结尾会误判，
+        所以那里不发 C-c 而发 C-a C-k（行首 + 删到行尾）：只清残留的半行，误判时也只是几个控制字符，不会杀掉程序。
         """
-        if self.busy(pane_pid):
+        if self.busy(pane_pid, name):
             return False
-        self._run("send-keys", "-t", self.target(name), "C-c")
+        t = self.target(name)
+        self._leave_copy_mode(t)
+        if self.nested(pane_pid):  # 判为空闲却还有子进程：只能是转接进程
+            self.clear_line(name)
+        else:
+            self._run("send-keys", "-t", t, "C-c")
         return True
+
+    def nested(self, pane_pid: int) -> bool:
+        """窗口里只有 srun/salloc/ssh 这类转接进程，即身处嵌套 shell。"""
+        kids = self.children(pane_pid)
+        return bool(kids) and all(k in WRAPPERS for k in kids)
+
+    def clear_line(self, name: str) -> None:
+        """C-a C-k：行首 + 删到行尾，清掉没发出的半行。是普通控制字符、不是信号，发给正在跑的程序也不会杀掉它。"""
+        t = self.target(name)
+        self._leave_copy_mode(t)
+        self._run("send-keys", "-t", t, "C-a", "C-k")
 
     def send(self, name: str, text: str) -> None:
         t = self.target(name)
+        self._leave_copy_mode(t)
         self._run("send-keys", "-t", t, "-l", "--", text)
         self._run("send-keys", "-t", t, "C-m")
 
