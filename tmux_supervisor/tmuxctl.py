@@ -47,6 +47,16 @@ class Tmux:
             time.sleep(0.2)
         return True
 
+    def clear_input(self, name: str, pane_pid: int) -> bool:
+        """发命令前清掉 shell 输入行上的残留（没发出的半行、续行提示符 `>`、Ctrl-R 搜索等）：在空闲 shell 里发 C-c 即可全部取消。
+
+        C-c 会打断前台程序，所以只在刚确认窗口空闲时才发；有程序在跑时什么也不发并返回 False。
+        """
+        if self.busy(pane_pid):
+            return False
+        self._run("send-keys", "-t", self.target(name), "C-c")
+        return True
+
     def send(self, name: str, text: str) -> None:
         t = self.target(name)
         self._run("send-keys", "-t", t, "-l", "--", text)

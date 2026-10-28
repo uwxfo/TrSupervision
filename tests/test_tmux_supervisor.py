@@ -1,4 +1,5 @@
 import os
+import pickle
 from unittest import mock
 import re
 import signal
@@ -11,7 +12,7 @@ import unittest
 import zipfile
 from pathlib import Path
 
-from tmux_supervisor.supervisor import (AlreadyRunning, MonitorStop, Supervisor, acquire_lock,
+from tmux_supervisor.supervisor import (OOM_RE, AlreadyRunning, MonitorStop, Supervisor, acquire_lock,
                                         find_checkpoint, running_monitors, with_resume)
 from tmux_supervisor.tasks import load_windows, move_task, parse_task
 from tmux_supervisor.tmuxctl import Tmux, TmuxError
@@ -93,11 +94,14 @@ def plain(lines):
     return [re.sub(r"  # \[done .*\]$", "", l) for l in lines]
 
 
-def make_ckpt(path: Path, valid: bool = True):
+def make_ckpt(path: Path, valid: bool = True, epoch=None):
+    """造一个 torch.save 风格的 zip checkpoint；给了 epoch 就在 data.pkl 里写出真实的 pickle，否则内容不是合法 pickle。"""
     with zipfile.ZipFile(path, "w") as z:
-        z.writestr("data.pkl", "x" * 1000)
+        z.writestr("archive/data.pkl", pickle.dumps({"epoch": epoch, "model": {"w": [0.0] * 10}}, protocol=2)
+                   if epoch is not None else "x" * 1000)
     if not valid:  # 模拟写到一半被打断：砍掉文件尾的 zip 目录
-        path.write_bytes(path.read_bytes()[:600])
+        data = path.read_bytes()
+        path.write_bytes(data[:len(data) // 2])
 
 
 class ResumeHelperTest(unittest.TestCase):
@@ -106,17 +110,58 @@ class ResumeHelperTest(unittest.TestCase):
 
     def test_find_checkpoint_prefers_latest_valid(self):
         self.assertIsNone(find_checkpoint(self.d))
-        make_ckpt(self.d / "checkpoint0019.pth")
-        make_ckpt(self.d / "checkpoint0039.pth")
-        make_ckpt(self.d / "checkpoint_best.pth")  # 不是训练进度，不应被选中
+        make_ckpt(self.d / "checkpoint0019.pth", epoch=19)
+        make_ckpt(self.d / "checkpoint0039.pth", epoch=39)
+        make_ckpt(self.d / "checkpoint_best.pth", epoch=99)  # 不是训练进度，不应被选中
         self.assertEqual(find_checkpoint(self.d).name, "checkpoint0039.pth")
-        make_ckpt(self.d / "checkpoint.pth")
+        make_ckpt(self.d / "checkpoint.pth", epoch=44)
         self.assertEqual(find_checkpoint(self.d).name, "checkpoint.pth")
 
     def test_find_checkpoint_skips_truncated(self):
-        make_ckpt(self.d / "checkpoint0019.pth")
-        make_ckpt(self.d / "checkpoint.pth", valid=False)
+        make_ckpt(self.d / "checkpoint0019.pth", epoch=19)
+        make_ckpt(self.d / "checkpoint.pth", valid=False, epoch=25)
         self.assertEqual(find_checkpoint(self.d).name, "checkpoint0019.pth")
+
+    def test_checkpoint_pth_older_than_numbered_is_not_preferred(self):
+        # checkpoint.pth 不再无条件优先：它的 epoch 比编号文件旧时（如被旧运行遗留）应选编号文件
+        make_ckpt(self.d / "checkpoint.pth", epoch=5)
+        make_ckpt(self.d / "checkpoint0019.pth", epoch=19)
+        self.assertEqual(find_checkpoint(self.d).name, "checkpoint0019.pth")
+
+    def test_same_epoch_prefers_newer_mtime(self):
+        make_ckpt(self.d / "checkpoint.pth", epoch=19)
+        make_ckpt(self.d / "checkpoint0019.pth", epoch=19)
+        os.utime(self.d / "checkpoint0019.pth", (1000, 1000))
+        self.assertEqual(find_checkpoint(self.d).name, "checkpoint.pth")
+        os.utime(self.d / "checkpoint.pth", (500, 500))
+        self.assertEqual(find_checkpoint(self.d).name, "checkpoint0019.pth")
+
+    def test_numbered_files_sorted_numerically_not_as_strings(self):
+        # 内容读不出 epoch 时按文件名里的数字比较："checkpoint100" 的字符串序比 "checkpoint99" 小
+        make_ckpt(self.d / "checkpoint99.pth")
+        make_ckpt(self.d / "checkpoint100.pth")
+        self.assertEqual(find_checkpoint(self.d).name, "checkpoint100.pth")
+
+    def test_unreadable_epoch_falls_back_to_mtime(self):
+        make_ckpt(self.d / "checkpoint.pth")  # 读不出 epoch
+        make_ckpt(self.d / "checkpoint0019.pth", epoch=19)
+        os.utime(self.d / "checkpoint0019.pth", (1000, 1000))
+        self.assertEqual(find_checkpoint(self.d).name, "checkpoint.pth")
+        os.utime(self.d / "checkpoint.pth", (500, 500))
+        self.assertEqual(find_checkpoint(self.d).name, "checkpoint0019.pth")
+
+    def test_reading_epoch_never_executes_pickle_code(self):
+        marker = self.d / "pwned"
+
+        class Evil:
+            def __reduce__(self):
+                return (os.system, (f"touch {marker}",))
+
+        with zipfile.ZipFile(self.d / "checkpoint.pth", "w") as z:
+            z.writestr("archive/data.pkl", pickle.dumps({"epoch": 7, "x": Evil()}, protocol=2))
+        make_ckpt(self.d / "checkpoint0003.pth", epoch=3)
+        self.assertEqual(find_checkpoint(self.d).name, "checkpoint.pth")  # epoch 7 照常读出
+        self.assertFalse(marker.exists())
 
     def test_with_resume(self):
         p = Path("/a b/ck.pth")
@@ -188,7 +233,7 @@ class TmuxCase(SocketCleanupMixin, unittest.TestCase):
         self.sup = self.make()
 
     def make(self, **kw):
-        kw = {"retry_delay": 0.2, "start_grace": 1, **kw}
+        kw = {"retry_delay": 0.2, "start_grace": 1, "interrupt_wait": 0.3, **kw}  # 手动中断后的等待在这里缩短，免得每个用例等 30s
         return Supervisor(self.dir / "task.md", self.dir / "state", self.dir / "logs", self.tm, "w1",
                           echo=self.out.append, **kw)
 
@@ -314,6 +359,89 @@ class RetryTest(TmuxCase):
         self.drive(lambda: bool(self.win().failed))
         self.assertEqual((self.dir / "seen").read_text().split(), ["bs=1"])
         self.assertIn("no reducible --batch_size", self.win().failed[0])
+
+    def _accum_script(self, name, default_bs=8, default_acc=1):
+        """batch_size / accum_steps 默认值写在脚本里、额外参数追加在最后的训练脚本；bs>2 时报 CUDA OOM。
+        每次运行把 "bs=N acc=M" 记到 seen，并像 main.py 一样把两者打到日志的 Namespace 里。"""
+        script = self.dir / name
+        script.write_text(
+            f'args=(--batch_size {default_bs} --accum_steps {default_acc} "$@")\n'
+            'bs=0; acc=0\n'
+            'for ((i=0; i<${#args[@]}; i++)); do\n'
+            '  [ "${args[$i]}" = --batch_size ] && bs=${args[$((i+1))]}\n'
+            '  [ "${args[$i]}" = --accum_steps ] && acc=${args[$((i+1))]}\n'
+            'done\n'
+            'echo "Namespace(batch_size=$bs, accum_steps=$acc, seed=1)"\n'
+            'echo "bs=$bs acc=$acc" >> seen\n'
+            'if [ "$bs" -gt 2 ]; then echo "torch.cuda.OutOfMemoryError: CUDA out of memory." >&2; exit 1; fi\n'
+            'echo ok >> seen\n')
+        return script
+
+    def _seen(self):
+        return (self.dir / "seen").read_text().split("\n")[:-1]
+
+    def test_oom_halving_batch_doubles_accum_steps_when_both_in_script(self):
+        script = self._accum_script("a1.sh")  # 任务行里两个参数都没有，值在脚本里
+        self.write_tasks(f"## task-list\nbash {script}\n")
+        self.drive(lambda: (self.dir / "seen").exists() and "ok" in self._seen())
+        self.assertEqual(self._seen(), ["bs=8 acc=1", "bs=4 acc=2", "bs=2 acc=4", "ok"])  # 逻辑 batch 恒为 8
+        self.assertIn("--accum_steps 1 -> 2", self.text())
+
+    def test_oom_rewrites_accum_steps_in_command_in_place(self):
+        script = self._accum_script("a2.sh")
+        self.write_tasks(f"## task-list\nbash {script} --batch_size 8 --accum_steps 3\n")
+        self.drive(lambda: (self.dir / "seen").exists() and "ok" in self._seen())
+        self.assertEqual(self._seen(), ["bs=8 acc=3", "bs=4 acc=6", "bs=2 acc=12", "ok"])
+        starts = [l for l in self.out if "start:" in l]
+        self.assertTrue(all(l.count("--accum_steps") == 1 and l.count("--batch_size") == 1 for l in starts), starts)
+
+    def test_oom_batch_in_command_accum_only_in_script_appends_accum(self):
+        script = self._accum_script("a3.sh", default_acc=2)
+        self.write_tasks(f"## task-list\nbash {script} --batch_size 8\n")
+        self.drive(lambda: (self.dir / "seen").exists() and "ok" in self._seen())
+        self.assertEqual(self._seen(), ["bs=8 acc=2", "bs=4 acc=4", "bs=2 acc=8", "ok"])
+
+    def test_oom_odd_batch_rounds_accum_up(self):
+        script = self._accum_script("a4.sh", default_bs=5)
+        self.write_tasks(f"## task-list\nbash {script}\n")
+        self.drive(lambda: (self.dir / "seen").exists() and "ok" in self._seen())
+        self.assertEqual(self._seen(), ["bs=5 acc=1", "bs=2 acc=3", "ok"])  # 5//2=2，accum=ceil(5/2)=3（逻辑 batch 6，略增大）
+
+    def test_oom_regex_covers_common_cuda_oom_formats(self):
+        for msg in [
+            "torch.cuda.OutOfMemoryError: CUDA out of memory. Tried to allocate 2.00 GiB",
+            "torch.OutOfMemoryError: CUDA out of memory. Tried to allocate 20.00 MiB",
+            "torch.cuda.OutOfMemoryError: ",
+            "OutOfMemoryError",
+            "RuntimeError: CUDA error: out of memory",
+            "RuntimeError: CUDA driver error: out of memory",
+            "CUDA_ERROR_OUT_OF_MEMORY: out of memory",
+            "cudaErrorMemoryAllocation: out of memory",
+            "RuntimeError: CUDA error: cudaErrorMemoryAllocation",
+            "Tried to allocate 20.00 MiB (GPU 0; 15.78 GiB total capacity; 14.2 GiB already allocated)",
+            "RuntimeError: CUBLAS_STATUS_ALLOC_FAILED when calling `cublasCreate(handle)`",
+            "RuntimeError: cuDNN error: CUDNN_STATUS_ALLOC_FAILED",
+            "RuntimeError: cusolver error: CUSOLVER_STATUS_ALLOC_FAILED",
+            "torch.cuda.OutOfMemoryError: HIP out of memory. Tried to allocate 1.00 GiB",
+            "hipErrorOutOfMemory",
+            "NCCL error: unhandled cuda error, NCCL version 2.18, out of memory",
+        ]:
+            with self.subTest(msg=msg):
+                self.assertTrue(OOM_RE.search(msg), msg)
+
+    def test_oom_regex_ignores_non_oom_errors(self):
+        for msg in [
+            "RuntimeError: CUDA error: an illegal memory access was encountered",
+            "RuntimeError: CUDA error: device-side assert triggered",
+            "RuntimeError: DefaultCPUAllocator: can't allocate memory: you tried to allocate 1000 bytes",
+            "MemoryError",
+            "Killed",
+            "Memory usage: 12 GiB, out of 80 GiB",
+            "CUDA out of sync",
+            "KeyError: 'memory'",
+        ]:
+            with self.subTest(msg=msg):
+                self.assertFalse(OOM_RE.search(msg), msg)
 
     def test_exhausted_retries_go_to_failed_list_and_queue_continues(self):
         self.sup = self.make(max_retries=1)
@@ -462,6 +590,97 @@ class ManualInterruptTest(TmuxCase):
         self.assert_failed_then_next("no exit record")
 
 
+class InterruptWaitTest(TmuxCase):
+    """判为手动中断时先等一段时间（默认 30s）再移入 failed list 并启动下一条；等待期间 stop 可保住队列。"""
+
+    WAIT = 4
+
+    def start_checks(self):
+        """在线程里不停 check（等待是阻塞的），并记下"进入等待"和"移入 failed"两个事件的时间。"""
+        self.stamps = {}
+        orig = self.sup.echo
+
+        def echo(s):
+            for key, mark in (("wait", "waiting"), ("failed", "FAILED")):
+                if mark in s:
+                    self.stamps.setdefault(key, time.time())
+            orig(s)
+        self.sup.echo = echo
+
+        def loop():
+            end = time.time() + 40
+            while time.time() < end and not self.sup._stop and "failed" not in self.stamps:
+                try:
+                    self.sup.check()
+                except MonitorStop:
+                    return
+                time.sleep(0.3)
+        self.thread = threading.Thread(target=loop)
+        self.thread.start()
+        self.addCleanup(self.thread.join, 10)
+
+    def wait_for(self, cond, timeout=20):
+        end = time.time() + timeout
+        while time.time() < end:
+            if cond():
+                return
+            time.sleep(0.1)
+        self.fail(f"超时；输出={self.out}")
+
+    def assert_waits_before_failing(self):
+        self.wait_for(lambda: "wait" in self.stamps)
+        # 等待期间：任务还在 task-list 首行，failed list 为空，下一条没有启动
+        self.assertEqual(self.win().failed, [])
+        self.assertTrue(self.win().tasks[0].startswith(self.first))
+        self.assertFalse((self.dir / "next").exists())
+        self.wait_for(lambda: "failed" in self.stamps)
+        self.assertGreaterEqual(self.stamps["failed"] - self.stamps["wait"], self.WAIT - 0.2)
+        self.wait_for(lambda: (self.dir / "next").exists())
+        self.assertEqual(len(self.win().failed), 1)
+
+    def test_exit_code_130_waits_before_moving_to_failed(self):
+        self.sup = self.make(interrupt_wait=self.WAIT)
+        self.first = "bash -c 'exit 130'"
+        self.write_tasks(f"## task-list\n{self.first}\necho x > next\n")
+        self.start_checks()
+        self.assert_waits_before_failing()
+
+    def test_keyboard_interrupt_in_log_waits_before_moving_to_failed(self):
+        self.sup = self.make(interrupt_wait=self.WAIT)
+        self.first = "bash -c 'echo KeyboardInterrupt >&2; exit 1'"
+        self.write_tasks(f"## task-list\n{self.first}\necho x > next\n")
+        self.start_checks()
+        self.assert_waits_before_failing()
+
+    def test_idle_window_without_exit_record_waits_before_moving_to_failed(self):
+        self.sup = self.make(interrupt_wait=self.WAIT)
+        self.first = "sleep 60"
+        self.write_tasks(f"## task-list\n{self.first}\necho x > next\n")
+        self.sup.check()
+        time.sleep(1.2)  # 过了启动宽限期
+        subprocess.run(["pkill", "-KILL", "-P", str(self.tm.pane_pid("w1"))])
+        self.start_checks()
+        self.assert_waits_before_failing()
+
+    def test_stop_during_wait_keeps_task_in_queue(self):
+        self.sup = self.make(interrupt_wait=30)
+        self.write_tasks("## task-list\nbash -c 'exit 130'\necho x > next\n")
+        self.start_checks()
+        self.wait_for(lambda: "wait" in self.stamps)
+        self.sup.request_stop()
+        self.thread.join(10)
+        self.assertFalse(self.thread.is_alive())
+        self.assertEqual(self.win().failed, [])  # 没被移入 failed
+        self.assertEqual(self.win().tasks, ["bash -c 'exit 130'", "echo x > next"])  # 队列原样保留
+        self.assertFalse((self.dir / "next").exists())
+
+    def test_ordinary_failure_does_not_wait(self):
+        self.sup = self.make(interrupt_wait=60, max_retries=0)
+        self.write_tasks("## task-list\nbash -c 'exit 3'\necho x > next\n")
+        self.drive(lambda: (self.dir / "next").exists(), timeout=15)
+        self.assertEqual(len(self.win().failed), 1)
+
+
 class AutoStopTest(TmuxCase):
     """窗口丢失等无法继续的情况：监控自动结束（MonitorStop），任务留在 task-list 首行。"""
 
@@ -484,6 +703,67 @@ class ExternalCommandTest(TmuxCase):
         self.assertIn("not started by this tool", self.text())
         self.assertFalse((self.dir / "out").exists())
         self.drive(lambda: (self.dir / "out").exists())
+
+
+class DirtyInputTest(TmuxCase):
+    """窗口 shell 里有残留字符时，发出的命令不能被它们污染；窗口里有外部程序在跑时一个按键都不能发。"""
+
+    def type_raw(self, text, enter=False):
+        t = self.tm.target("w1")
+        self.tm._run("send-keys", "-t", t, "-l", "--", text)
+        if enter:
+            self.tm._run("send-keys", "-t", t, "C-m")
+        time.sleep(0.5)
+
+    def assert_queue_runs_cleanly(self):
+        self.write_tasks("## task-list\necho ok >> out\n")
+        self.drive(lambda: (self.dir / "out").exists() and self.sup.load_state()["run_id"] is None)
+        self.assertEqual((self.dir / "out").read_text(), "ok\n")
+        self.assertEqual(self.win().failed, [])
+        self.assertEqual(plain(self.win().worked), ["echo ok >> out"])
+
+    def test_leftover_text_on_prompt_is_cleared(self):
+        self.type_raw("garbage")
+        self.assert_queue_runs_cleanly()
+
+    def test_unfinished_quote_continuation_is_cleared(self):
+        self.type_raw("echo 'abc", enter=True)  # shell 停在续行提示符 `> `
+        self.assert_queue_runs_cleanly()
+
+    def run_external_sigint_probe(self):
+        """在窗口里手动起一个外部程序：约 3 秒，收到 SIGINT 就记 got，正常结束记 end（用绝对路径，不依赖 cwd）。"""
+        sig = self.dir / "sig"
+        self.type_raw(f"bash -c 'trap \"echo got >> {sig}\" INT; for i in 1 2 3 4 5 6; do sleep 0.5; done; echo end >> {sig}'",
+                      enter=True)
+        return sig
+
+    def test_clear_input_sends_nothing_while_a_command_runs(self):
+        sig = self.run_external_sigint_probe()
+        pid = self.tm.pane_pid("w1")
+        self.assertTrue(self.tm.busy(pid))
+        self.assertFalse(self.tm.clear_input("w1", pid))  # 忙碌：不发 C-c
+        self.assertTrue(self.tm.wait_idle(pid, 10))
+        self.assertEqual(sig.read_text(), "end\n")  # 没收到 SIGINT，跑到了结尾
+
+    def test_external_command_survives_and_queue_waits(self):
+        self.write_tasks("## task-list\necho queued >> out\n")
+        sig = self.run_external_sigint_probe()
+        self.sup.check()
+        self.assertEqual(self.sup.load_state()["status"], "external")
+        self.assertFalse((self.dir / "out").exists())
+        self.drive(lambda: (self.dir / "out").exists())
+        self.assertEqual(sig.read_text(), "end\n")  # 外部程序没被打断，队列等它结束后才启动
+
+    def test_launch_while_a_command_started_after_idle_check_leaves_it_alone(self):
+        # 竞态：监控以为窗口空闲，真正发键时窗口已被外部程序占用 -> 不发任何键，任务留在 task-list，之后当外部命令等待
+        self.write_tasks("## task-list\necho queued >> out\n")
+        sig = self.run_external_sigint_probe()
+        self.sup._start_next(self.win(), self.sup.load_state())  # 跳过空闲检查直接启动
+        self.assertIsNone(self.sup.load_state()["run_id"])
+        self.assertEqual(self.win().tasks, ["echo queued >> out"])
+        self.assertIn("not started by this tool", self.text())
+        self.drive(lambda: (self.dir / "out").exists())
+        self.assertEqual(sig.read_text(), "end\n")
 
 
 class StartFreshTest(TmuxCase):

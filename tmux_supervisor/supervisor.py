@@ -6,6 +6,7 @@
 import fcntl
 import json
 import os
+import pickle
 import re
 import shlex
 import subprocess
@@ -18,13 +19,22 @@ from typing import Dict, List, Optional
 from .tasks import Window, load_windows, move_task, parse_task
 from .tmuxctl import Tmux, TmuxError
 
-# 只匹配 CUDA 显存不足；"illegal memory access" 之类不是 OOM，减小 batch 没用。
-OOM_RE = re.compile(r"CUDA out of memory|CUDA error:.*out of memory|CUBLAS_STATUS_ALLOC_FAILED"
-                    r"|CUDNN_STATUS_ALLOC_FAILED", re.I)
+# 只匹配 GPU 显存不足；"illegal memory access"、CPU 内存不足（DefaultCPUAllocator / Killed）不是 OOM，减小 batch 没用。
+# 各行依次是：torch.cuda.OutOfMemoryError / torch.OutOfMemoryError；同一行里 cuda/hip 与 out of memory 同现
+# （CUDA out of memory、CUDA error: out of memory、CUDA driver error、NCCL 转述的 cuda 错误、HIP out of memory）；
+# 错误码标识符；PyTorch 的 "Tried to allocate ... (GPU 0; ...)"；cuBLAS/cuDNN/cuSOLVER 等的 *_STATUS_ALLOC_FAILED。
+OOM_RE = re.compile(r"OutOfMemoryError"
+                    r"|(?:\bcuda|\bhip)[^\n]*out of memory"
+                    r"|CUDA_ERROR_OUT_OF_MEMORY|(?:cuda|hip)Error(?:MemoryAllocation|OutOfMemory)"
+                    r"|Tried to allocate [\d.]+ \w+ \(GPU \d"
+                    r"|\bCU[A-Z]+_STATUS_ALLOC_FAILED", re.I)
 # 命令行里的 batch_size 参数（支持 `--batch_size 4` 与 `--batch_size=4`），OOM 重试时改写它
 BATCH_ARG_RE = re.compile(r"(--batch_size[ =])(\d+)")
 # 训练程序启动时 print(args) 里的 batch_size=N，是本次运行实际生效的值（batch_size 写在脚本里时命令行上看不到）
 BATCH_LOG_RE = re.compile(r"\bbatch_size=(\d+)")
+# accum_steps（梯度累积步数）的读法同 batch_size：先看命令行，再看日志 print(args) 里的 accum_steps=N
+ACCUM_ARG_RE = re.compile(r"(--accum_steps[ =])(\d+)")
+ACCUM_LOG_RE = re.compile(r"\baccum_steps=(\d+)")
 # 训练程序启动时会 print(args)，其中的 output_dir 即本次运行实际写 checkpoint 的目录（相对任务的 workdir）
 OUTPUT_DIR_RE = re.compile(r"output_dir='([^']+)'")
 RESUME_ARG_RE = re.compile(r"--resume(?:=|\s+)(?:'[^']*'|\"[^\"]*\"|\S+)")
@@ -33,6 +43,7 @@ RESUME_ARG_RE = re.compile(r"--resume(?:=|\s+)(?:'[^']*'|\"[^\"]*\"|\S+)")
 # 或 torchrun 的 "got signal: 2/15"，也算手动中断。其余错误（含 120）当普通错误重试。
 INTERRUPT_RCS = (130, 143)
 INTERRUPT_LOG_RE = re.compile(r"KeyboardInterrupt|SignalException: .*got signal: (?:2|15)\b")
+INTERRUPT_WAIT = 30  # 判为手动中断后，等多久才移入 failed list 并启动下一条（这段时间内 stop 可保住队列）
 START_GRACE = 15  # 发出命令后，等多久才允许判定"窗口空闲却没有退出记录"（shell 启动子进程需要时间）
 LOG_TAIL_BYTES = 200_000  # 判断错误类型时只读日志末尾；找 output_dir 时读日志开头同样大小
 
@@ -55,14 +66,74 @@ def safe(name: str) -> str:
     return re.sub(r"[^\w.-]", "_", name)
 
 
+NUMBERED_CKPT_RE = re.compile(r"checkpoint(\d+)\.pth")  # 训练程序写作 checkpoint{epoch:04}.pth，数字即 epoch
+
+
+class _Stub:
+    """读 checkpoint 的 epoch 时代替 pickle 里的所有类和函数：只造空壳，不执行 pickle 携带的任何代码。"""
+
+    def __init__(self, *args, **kwargs):
+        pass
+
+    def __setstate__(self, state):
+        pass
+
+    def __setitem__(self, key, value):
+        pass
+
+
+class _EpochUnpickler(pickle.Unpickler):
+    def find_class(self, module, name):
+        return _Stub
+
+    def persistent_load(self, pid):  # torch.save 把张量存储放在 zip 的其他条目里，这里不读
+        return None
+
+
+def read_epoch(path: Path) -> Optional[int]:
+    """读出 torch.save 写的 checkpoint 里的 'epoch'；只解析 zip 里很小的 data.pkl，不加载约 2GB 的张量，也不依赖 torch。读不出返回 None。"""
+    try:
+        with zipfile.ZipFile(path) as z:
+            name = next(n for n in z.namelist() if n == "data.pkl" or n.endswith("/data.pkl"))
+            with z.open(name) as f:
+                epoch = _EpochUnpickler(f).load()["epoch"]
+        return epoch if isinstance(epoch, int) and not isinstance(epoch, bool) else None
+    except Exception:
+        return None
+
+
 def find_checkpoint(out_dir: Path) -> Optional[Path]:
-    """返回目录里最新的完好 checkpoint：先 checkpoint.pth（每个 epoch 覆盖写），再按编号从大到小的 checkpointNNNN.pth。
+    """返回目录里最新的完好 checkpoint：checkpoint.pth（每个 epoch 覆盖写）和 checkpointNNNN.pth 中 epoch 最大者。
+
+    不再无条件优先 checkpoint.pth：它可能是旧运行遗留的，比编号文件旧。epoch 优先取文件内容里的 'epoch'，
+    读不出的编号文件取文件名里的数字（按数值而不是字符串比较）；epoch 相同取修改时间新的。
+    只要有候选读不出 epoch（checkpoint.pth 内容无法解析），所有候选就都退回按修改时间比较。
 
     torch.save 写的是 zip，被中途打断（如磁盘写满）的文件缺少文件尾的目录，is_zipfile 为 False，据此跳过损坏文件；
     不用 testzip 逐字节校验，因为单个 checkpoint 约 2GB，在 NFS 上太慢。
     """
-    cands = [out_dir / "checkpoint.pth"] + sorted(out_dir.glob("checkpoint[0-9]*.pth"), reverse=True)
-    return next((p for p in cands if p.is_file() and zipfile.is_zipfile(p)), None)
+    cands = [p for p in [out_dir / "checkpoint.pth", *out_dir.glob("checkpoint[0-9]*.pth")]
+             if (p.name == "checkpoint.pth" or NUMBERED_CKPT_RE.fullmatch(p.name)) and p.is_file() and zipfile.is_zipfile(p)]
+    if not cands:
+        return None
+    info = []  # (路径, epoch 或 None, 修改时间)
+    for p in cands:
+        epoch = read_epoch(p)
+        m = NUMBERED_CKPT_RE.fullmatch(p.name)
+        if epoch is None and m:
+            epoch = int(m.group(1))
+        info.append((p, epoch, p.stat().st_mtime))
+    if all(e is not None for _, e, _ in info):
+        return max(info, key=lambda t: (t[1], t[2]))[0]
+    return max(info, key=lambda t: (t[2], -1 if t[1] is None else t[1]))[0]
+
+
+def with_arg(cmd: str, arg_re: "re.Pattern", flag: str, value: int) -> str:
+    """把命令里的 `flag N` 改成 value（多次出现改最后一个，argparse 以它为准）；命令里没有就追加到末尾。"""
+    hits = list(arg_re.finditer(cmd))
+    if hits:
+        return cmd[:hits[-1].start(2)] + str(value) + cmd[hits[-1].end(2):]
+    return f"{cmd} {flag} {value}"
 
 
 def with_resume(cmd: str, ckpt: Path) -> str:
@@ -106,11 +177,12 @@ def running_monitors(state_dir: Path) -> Dict[str, int]:
 class Supervisor:
     def __init__(self, task_file: Path, state_dir: Path, log_dir: Path, tmux: Tmux, name: str,
                  max_retries: int = 3, retry_delay: float = 10.0, auto_resume: bool = True,
-                 start_grace: float = START_GRACE, echo=lambda s: print(s, flush=True)):
+                 start_grace: float = START_GRACE, interrupt_wait: float = INTERRUPT_WAIT,
+                 echo=lambda s: print(s, flush=True)):
         self.task_file, self.state_dir, self.log_dir = Path(task_file), Path(state_dir), Path(log_dir)
         self.tmux, self.name = tmux, name
         self.max_retries, self.retry_delay, self.auto_resume = max_retries, retry_delay, auto_resume
-        self.start_grace, self.echo = start_grace, echo
+        self.start_grace, self.interrupt_wait, self.echo = start_grace, interrupt_wait, echo
         self._stop = False
         self.finished = False  # 队列跑空且没有任务在运行：监控完成使命，run_forever 据此退出
         self.state_dir.mkdir(parents=True, exist_ok=True)
@@ -209,7 +281,7 @@ class Supervisor:
                 self._save(st)
             else:
                 # 没有退出记录：进程被杀或终端被关，按手动中断处理
-                self._fail(st, "manually interrupted (no exit record: process killed or terminal closed)", log_lines=True)
+                self._interrupted(st, "manually interrupted (no exit record: process killed or terminal closed)", log_lines=True)
             return
 
         if self.tmux.busy(pid):
@@ -233,7 +305,7 @@ class Supervisor:
             self._clear_run(st)
             self._start_next(self._window(), st)
         elif rc in INTERRUPT_RCS or INTERRUPT_LOG_RE.search(self._log_tail(st["log"])):
-            self._fail(st, f"manually interrupted (exit code {rc})")
+            self._interrupted(st, f"manually interrupted (exit code {rc})")
         else:
             self._retry(w, st, rc)
 
@@ -244,6 +316,16 @@ class Supervisor:
         if m:
             note += f" output_dir={os.path.normpath(os.path.join(st['workdir'], m.group(1)))}"
         return note
+
+    def _interrupted(self, st: dict, note: str, log_lines: bool = False) -> None:
+        """手动中断：先等 interrupt_wait 秒再按失败处理。这段时间里用户可以 stop / Ctrl-C 监控来保住队列，
+        否则被中断的任务会立刻进 failed list、下一条立刻开跑。"""
+        self.event(f"{note}: {st['raw']}; waiting {self.interrupt_wait:g}s before moving it to failed list and starting the next command "
+                   "(`stop` the monitor now to keep the queue as is)")
+        self._sleep(self.interrupt_wait)
+        if self._stop:  # 等待期间收到 stop：任务留在 task-list 首行，什么都不动
+            return
+        self._fail(st, note, log_lines)
 
     def _fail(self, st: dict, note: str, log_lines: bool = False) -> None:
         """把当前任务移入 failed list，把原因打印到终端，窗口继续下一条。"""
@@ -277,11 +359,16 @@ class Supervisor:
                 return self._fail(st, "CUDA OOM and no reducible --batch_size (not in the command or the log, or already 1)",
                                   log_lines=True)
             new = max(1, old // 2)
-            self.event(f"CUDA OOM: --batch_size {old} -> {new}")
-            if hits:
-                cmd = cmd[:hits[-1].start(2)] + str(new) + cmd[hits[-1].end(2):]
-            else:
-                cmd = f"{cmd} --batch_size {new}"  # 脚本把 "$@" 追加在自己的 --batch_size 之后，argparse 取最后一个
+            # 梯度累积：batch 减半的同时把 accum_steps 加倍，逻辑 batch（world_size * batch_size * accum_steps）保持不变；
+            # 奇数 batch 除不尽时 accum_steps 向上取整，逻辑 batch 略增大。命令行上没有就读日志，再没有就当作 1。
+            acc_hits = ACCUM_ARG_RE.findall(cmd)
+            m_acc = ACCUM_LOG_RE.search(self._log_head(st["log"]))
+            old_acc = int(acc_hits[-1][1]) if acc_hits else int(m_acc.group(1)) if m_acc else 1
+            new_acc = -(-old * old_acc // new)
+            self.event(f"CUDA OOM: --batch_size {old} -> {new}, --accum_steps {old_acc} -> {new_acc}")
+            # 命令里没有就追加到末尾：脚本把 "$@" 放在自己的参数之后，argparse 取最后一个
+            cmd = with_arg(cmd, BATCH_ARG_RE, "--batch_size", new)
+            cmd = with_arg(cmd, ACCUM_ARG_RE, "--accum_steps", new_acc)
         else:
             self.event(f"command failed (exit code {rc}); retrying unchanged")
         st["attempts"] += 1
@@ -335,6 +422,14 @@ class Supervisor:
 
     def _launch(self, w: Window, st: dict, cmd: str, run_cmd: Optional[str] = None) -> None:
         run_cmd = run_cmd or cmd
+        pid = self.tmux.pane_pid(self.name)
+        if pid is None:
+            raise MonitorStop(f"tmux window {self.name} does not exist or was closed")
+        # 先清掉输入行上的残留字符，否则它们会和包装命令拼在一起导致语法错误；
+        # 窗口已被外部程序占用（空闲检查之后才启动）时一个键都不发，免得 C-c 把它打断，任务留在 task-list 等它结束。
+        if not self.tmux.clear_input(self.name, pid):
+            self.event("a command not started by this tool is running in the window; will start the task after it finishes")
+            return self._clear_run(st)
         run_id = str(time.time_ns())
         log = self.log_dir / f"{safe(self.name)}-{run_id}.log"
         exit_file = self.state_dir / f"{safe(self.name)}.{run_id}.exit"

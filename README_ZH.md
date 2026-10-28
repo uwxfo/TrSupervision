@@ -29,7 +29,7 @@ bash train_a.sh --batch_size 8
 ```
 - **以 `#` 开头的整行是注释，不会执行**；想启用被注释的命令要删掉行首的 `# `。
 - **运行中的命令一直留在 `task-list` 首行，成功后才移到 `worked list`**；重试用完或 shell 语法错误才移到 `failed list`。
-  手动中断的任务也移到 `failed list`（原因 `manually interrupted ...`），然后继续下一条。
+  手动中断的任务也移到 `failed list`（原因 `manually interrupted ...`），然后继续下一条，两步都在等 30 秒之后（见下）。
 - **工作目录**：`[workdir=路径]` 只对这一条生效（相对路径相对窗口的 `workdir`），**后面的任务不受影响**，仍用窗口的 `workdir`。
 - **worked 条目的注释**：`bash a.sh  # [done log=/path/logs/1-123.log output_dir=/path/output/run_0425]`。
   `log` 是这次成功运行的完整输出日志；`output_dir` 是训练程序实际写 checkpoint 的目录（从日志里的 `output_dir='...'` 解析，没有则省略）。
@@ -46,6 +46,9 @@ tmux 本身不提供命令的退出码，所以工具启动命令时在外面包
 - 退出码 0 → 成功，移入 worked list，启动队列下一条。
 - 其他非 0 → 失败，进入重试（见下）。
 - 130 / 143、退出码非 0 且日志末尾带 `KeyboardInterrupt` 或 torchrun 的 `got signal: 2/15`（torchrun 捕获 Ctrl-C 后以 1 退出）、或窗口已空闲但没有退出记录 → 视为**手动中断**：移入 `failed list`，继续下一条（不重试）。
+- **手动中断不会立刻处理**：监控先打印提示并等待 **30 秒**（`supervisor.py` 里的 `INTERRUPT_WAIT`），之后才把任务移入 `failed list` 并启动下一条。
+  这 30 秒里任务仍在 `task-list` 首行、不会启动任何新命令，你可以 `./tmuxsup stop <窗口>`（队列原样保留，被中断的任务不会移入 `failed list`），
+  或对监控按 Ctrl-C 保住队列。Ctrl-C 后再 `run`，会发现任务已不在运行而再次判为中断，重新等 30 秒。普通失败（重试、OOM）不等待。
 - 其余情况（包括 120，如磁盘写满）按普通错误重试。
 - `tee -i` 让 tee 忽略 Ctrl-C。否则 Ctrl-C 会连 tee 一起杀掉，任务最后一次 flush 失败、Python 以 120 退出，真实退出码和最后的日志都会丢失。
 
@@ -56,16 +59,25 @@ tmux 本身不提供命令的退出码，所以工具启动命令时在外面包
     减半后在命令末尾**追加 `--batch_size <新值>`**（argparse 取最后一个）。
   - 脚本需把额外参数（`"$@"`）透传给训练程序，且放在自己的 `--batch_size` 之后。若日志里的 `batch_size` 与命令里的 `--batch_size`
     不一致，说明覆盖没生效，直接移入 `failed list` 并写明原因，不会白白重试。
+  - **梯度累积**：每次 `batch_size` 减半，`accum_steps` 同时加倍，使逻辑 batch（`world_size * batch_size * accum_steps`）不变。
+    旧 `accum_steps` 的读法同 `batch_size`：命令里的 `--accum_steps N`，没有则读日志 `print(args)` 里的 `accum_steps=N`，再没有按 1；
+    新值在命令里原位改写，没有就**追加 `--accum_steps <新值>`**。8/1 → 4/2 → 2/4。`batch_size` 为奇数时减半取整、`accum_steps` 向上取整
+    （5/1 → 2/3，逻辑 batch 由 5 变 6）。训练程序需支持 `--accum_steps`。
 - 其余错误（读写错误等）→ 原命令重试。
 - 每次重试前等待 `--retry-delay` 秒。超过 `--max-retries` 次仍失败，或 OOM 时找不到可再减小的 `--batch_size`，
   把命令移入 `failed list`，在终端打印原因（含日志最后 3 行），**窗口继续跑队列下一条**。
 - 队列首条命令有 shell 语法错误 → 同样移入 `failed list`（原因：shell 语法错误），继续下一条。
 - **自动续训**：重试时（不含队列里的新任务）先从上次运行的日志开头找 `output_dir='...'`（训练程序 `print(args)` 的输出，相对任务的工作目录），
-  在该目录里选最新的完好 checkpoint（`checkpoint.pth`，其次编号最大的 `checkpointNNNN.pth`，`checkpoint_best.pth` 不算），
+  在该目录里选最新的完好 checkpoint（`checkpoint.pth` 与 `checkpointNNNN.pth` 中 `epoch` 最大者，不再无条件优先可能是旧运行遗留的 `checkpoint.pth`；`checkpoint_best.pth` 不算。
+  `epoch` 从 checkpoint 里很小的 `data.pkl` 读出，不执行其中任何代码、不加载张量、不依赖 torch；相同则取修改时间新的。
+  读不出 `epoch` 时：编号文件取文件名里的数字（按数值而非字符串比较），只要有候选读不出就全部退回按修改时间比较），
   给本次重试的命令加 `--resume <路径>`；命令里已有 `--resume` 则替换。找不到 `output_dir` 或没有可用 checkpoint
   （例如启动阶段就失败）时原命令重试；写到一半被打断的损坏文件会被跳过。`--no-auto-resume` 可关闭。
   要求脚本把额外参数透传给 `main.py`，且后出现的 `--resume` 覆盖脚本内默认值（argparse 取最后一个）。
-- OOM 只匹配 CUDA out of memory、CUBLAS/CUDNN ALLOC_FAILED；"illegal memory access" 不算，减 batch 没用。
+- OOM 只匹配 GPU 显存不足：`OutOfMemoryError`（如 `torch.cuda.OutOfMemoryError`）、同一行含 `cuda`/`hip` 与 `out of memory`
+  （`CUDA out of memory`、`CUDA error: out of memory`、`CUDA driver error`、NCCL 转述的 cuda 错误）、`CUDA_ERROR_OUT_OF_MEMORY`、
+  `cudaErrorMemoryAllocation`、`Tried to allocate ... (GPU n ...)`、`CU*_STATUS_ALLOC_FAILED`。"illegal memory access"、
+  CPU 内存不足（`DefaultCPUAllocator`、`Killed`）不算，减 batch 没用。
 
 ## 队列跑完后监控自己退出
 一条命令成功（或最终失败）后，`task-list` 里没有剩余任务时，监控打印
@@ -76,7 +88,7 @@ tmux 本身不提供命令的退出码，所以工具启动命令时在外面包
 
 ## 自动结束监控（没有 paused 状态，也没有 resume 命令）
 下面这些情况无法继续，监控进程会**在终端打印原因并以退出码 1 结束**，任务仍留在 `task-list` 首行。
-手动中断（Ctrl-C、被杀、终端被关）**不在此列**：任务移入 `failed list` 后继续下一条；若你想停掉整个队列，用 `./tmuxsup stop <窗口>`。
+手动中断（Ctrl-C、被杀、终端被关）**不在此列**：等 30 秒后任务移入 `failed list` 再继续下一条；若你想停掉整个队列，用 `./tmuxsup stop <窗口>`（30 秒内任务仍留在 `task-list`）。
 手动中断里，"窗口空闲但没有退出记录"由轮询（`--poll`）发现，启动后 15 秒内为宽限期，不必等 `--interval`。
 - tmux 窗口不存在或运行中被关闭；`task.md` 里已没有该窗口的队列。
 - tmux 无响应：每次调用 `tmux` / `pgrep` 都有 15 秒超时，不会再因为某次调用卡住而无声冻结；超时则以 `tmux did not respond` 为原因结束监控。
@@ -88,6 +100,9 @@ tmux 本身不提供命令的退出码，所以工具启动命令时在外面包
   不会重复启动，也不会当成外部命令。监控进程被杀、终端被关闭同理。
 - **`stop`**、队列跑空、自动结束这几种情况会清空状态，下次 `run` 是全新的监控，因此：
 - 窗口里正在跑的命令（包括上次监控启动、仍在运行的）一律当作**外部命令**：在终端打印提示，等它结束，**不重试**。
+- **提示符处的残留字符**（没发出的半行、续行提示符 `>`、Ctrl-R 搜索）会和工具键入的命令拼在一起导致报错。所以发命令前，工具会对空闲的 shell
+  先发一个 `C-c` 清掉输入行；窗口里有命令在跑时一个键都不发，外部程序不会被打断；若在"判定空闲"到"发键"之间恰好有程序启动，
+  任务留在 `task-list`，等它结束后再启动。
 - **注意重复运行**：若你在任务 T 运行中 `stop` 了监控，T 还在 `task-list` 首行，T 结束后新监控会再启动一次 T。
   `stop` 前后请自行处理队列（例如把 T 删掉或移到 worked list）。
 - 同一窗口同时只允许一个监控进程（文件锁），重复 `run` 会被拒绝并提示 pid。

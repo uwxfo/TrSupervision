@@ -1,0 +1,5 @@
+# 运行时产生的文件和你自己的队列不入库
+state/
+logs/
+__pycache__/
+task.md.lock

@@ -30,7 +30,7 @@ bash train_a.sh --batch_size 8
 ```
 - **A whole line starting with `#` is a comment and is not executed.** To enable a commented-out command, remove the leading `# `.
 - **A running command stays on the first line of `task-list` until it succeeds**, then moves to `worked list`. It moves to
-  `failed list` only after retries are exhausted or on a shell syntax error. A manually interrupted task also moves to `failed list` (reason `manually interrupted ...`) and the next command starts.
+  `failed list` only after retries are exhausted or on a shell syntax error. A manually interrupted task also moves to `failed list` (reason `manually interrupted ...`) and the next command starts, both after a 30 s wait (see below).
 - **Working directory**: `[workdir=path]` applies to that one command only (a relative path is relative to the window's `workdir`);
   **the following tasks are not affected** and keep using the window's `workdir`.
 - **Note on a worked entry**: `bash a.sh  # [done log=/path/logs/1-123.log output_dir=/path/output/run_0425]`.
@@ -51,6 +51,10 @@ The tool decides from that file and never parses the screen:
 - Exit code 0 -> success: the command moves to the worked list and the next queued command starts.
 - Any other non-zero code -> failure: retry (see below).
 - 130 / 143, a non-zero exit whose log tail contains `KeyboardInterrupt` or torchrun's `got signal: 2/15` (torchrun catches Ctrl-C and exits with 1), or the window is idle with no exit record -> a **manual interruption**: moved to `failed list`, the next command starts (no retry).
+- **A manual interruption is not acted on at once**: the monitor prints a notice and waits **30 s** (`INTERRUPT_WAIT` in `supervisor.py`) before it moves the
+  task to `failed list` and starts the next command. During these 30 s the task is still on the first line of `task-list` and nothing new starts, so you
+  can `./tmuxsup stop <window>` (the queue stays exactly as it was; the interrupted task is not moved to `failed list`) or Ctrl-C the monitor to keep the queue.
+  After a Ctrl-C the next `run` finds the task not running and treats it as interrupted again, with another 30 s wait. Ordinary failures (retries, OOM) do not wait.
 - Anything else (including 120, e.g. a full disk) is an ordinary error and is retried.
 - `tee -i` makes `tee` ignore Ctrl-C. Without it, Ctrl-C also kills `tee`, the task's last flush fails and Python exits with 120, losing the real exit code and the final log lines.
 
@@ -62,6 +66,11 @@ The tool decides from that file and never parses the screen:
   - The script must pass extra arguments (`"$@"`) through to the training program, after its own `--batch_size`. If the log's `batch_size`
     differs from the command's `--batch_size`, the override is not applied; the command moves to `failed list` with that reason instead of
     retrying in vain.
+  - **Gradient accumulation**: whenever `batch_size` is halved, `accum_steps` is doubled so the logical batch size
+    (`world_size * batch_size * accum_steps`) stays the same. The old `accum_steps` is read like `batch_size`: `--accum_steps N` in the command,
+    else `accum_steps=N` from the log's `print(args)`, else 1; the new value is rewritten in place or **appended as `--accum_steps <new>`**.
+    8/1 -> 4/2 -> 2/4. An odd `batch_size` is halved with integer division and `accum_steps` is rounded up (5/1 -> 2/3, logical batch 5 -> 6).
+    The training program must support `--accum_steps`.
 - Any other error (read/write errors, ...) -> retry the command unchanged.
 - The tool waits `--retry-delay` seconds before each retry. If it still fails after `--max-retries` retries, or on an OOM when there is no
   `batch_size` left to reduce, the command moves to `failed list`, the reason is printed to the terminal (with the last 3 log lines),
@@ -69,12 +78,18 @@ The tool decides from that file and never parses the screen:
 - A shell syntax error in the first queued command -> it also moves to `failed list` (reason: shell syntax error) and the next command starts.
 - **Auto-resume**: on a retry (not for a new task from the queue), the tool finds `output_dir='...'` at the start of the previous run's log
   (printed by the training program via `print(args)`, relative to the task's working directory) and picks the newest intact checkpoint in that directory
-  (`checkpoint.pth`, then the highest-numbered `checkpointNNNN.pth`; `checkpoint_best.pth` is not training progress and is ignored).
+  (the one with the largest `epoch` among `checkpoint.pth` and `checkpointNNNN.pth`, so a stale `checkpoint.pth` is not preferred blindly;
+  `checkpoint_best.pth` is not training progress and is ignored). The `epoch` is read from the checkpoint's small `data.pkl` without executing
+  any code or loading the tensors (and without torch); on a tie the newer modification time wins. If an `epoch` cannot be read (for numbered files
+  it is taken from the file name, compared numerically), all candidates are compared by modification time instead.
   It then adds `--resume <path>` to the command for this retry; an existing `--resume` is replaced. If there is no `output_dir` or no usable
   checkpoint (for example the run failed during startup), the command is retried unchanged. Half-written, corrupt files are skipped.
   `--no-auto-resume` turns it off. The script has to pass extra arguments through to `main.py`, and a later `--resume` has to override the
   script's default (argparse keeps the last one).
-- Only CUDA out of memory and CUBLAS/CUDNN ALLOC_FAILED count as OOM; "illegal memory access" does not, because a smaller batch would not help.
+- Only GPU out-of-memory counts as OOM: `OutOfMemoryError` (e.g. `torch.cuda.OutOfMemoryError`), a `cuda`/`hip` line with `out of memory`
+  (`CUDA out of memory`, `CUDA error: out of memory`, `CUDA driver error`, NCCL relaying one), `CUDA_ERROR_OUT_OF_MEMORY`, `cudaErrorMemoryAllocation`,
+  `Tried to allocate ... (GPU n ...)`, `CU*_STATUS_ALLOC_FAILED`. "illegal memory access" and CPU out-of-memory (`DefaultCPUAllocator`, `Killed`)
+  do not count, because a smaller batch would not help.
 
 ## When the whole queue is done, the monitor exits
 When a command succeeds (or fails for good) and `task-list` has nothing left, the monitor prints
@@ -86,8 +101,8 @@ While a command that the tool did not start is still running in the window, the 
 ## Automatic end of monitoring (there is no paused state and no resume command)
 In the following cases it cannot go on, so the monitor **prints the reason to the terminal and exits with code 1**.
 The task stays on the first line of `task-list`.
-A manual interruption (Ctrl-C, process killed, terminal closed) is **not** one of them: the task moves to `failed list` and the next command starts;
-to stop the whole queue use `./tmuxsup stop <window>`. For the "idle with no exit record" kind of interruption, the monitor notices it in its
+A manual interruption (Ctrl-C, process killed, terminal closed) is **not** one of them: after a 30 s wait the task moves to `failed list` and the next command starts;
+to stop the whole queue use `./tmuxsup stop <window>` (within the 30 s the task stays in `task-list`). For the "idle with no exit record" kind of interruption, the monitor notices it in its
 polling loop (`--poll`) after a 15 s start grace period, without waiting for `--interval`.
 - The tmux window does not exist or was closed while running, or `task.md` no longer has a queue for that window.
 - tmux does not respond: every `tmux` / `pgrep` call has a 15 s timeout, so a hung call can no longer freeze the monitor silently; on a timeout it exits with the reason `tmux did not respond`.
@@ -101,6 +116,10 @@ Ending the monitor with `stop` or Ctrl-C exits with code 0.
 - **`stop`**, the queue draining, and the automatic-end cases clear the state, so the next `run` is a fresh monitoring session:
 - Any command already running in the window (including one started by the previous monitor that is still running) is treated as an **external command**:
   a notice is printed, the monitor waits for it to finish and **does not retry it**.
+- **Leftover characters at the prompt** (an unsent half line, a `>` continuation prompt, a Ctrl-R search) would be glued to the command the tool types
+  and break it. So right before typing a command the tool sends `C-c` to the idle shell to clear the line. It sends nothing while a command is running
+  in the window, so an external program is never interrupted; if one starts between the idle check and the keystroke, the task stays in `task-list`
+  and starts after it finishes.
 - **Beware of duplicate runs**: if you `stop` the monitor while task T is running, T is still on the first line of `task-list`, and after T finishes the new
   monitor will start T once more. Deal with the queue yourself around `stop` (for example delete T or move it to the worked list).
 - Only one monitor per window is allowed (file lock). A second `run` is refused and the pid of the running one is shown.
