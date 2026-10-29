@@ -71,6 +71,13 @@ The tool decides from that file and never parses the screen:
     else `accum_steps=N` from the log's `print(args)`, else 1; the new value is rewritten in place or **appended as `--accum_steps <new>`**.
     8/1 -> 4/2 -> 2/4. An odd `batch_size` is halved with integer division and `accum_steps` is rounded up (5/1 -> 2/3, logical batch 5 -> 6).
     The training program must support `--accum_steps`.
+- **Port in use** (`EADDRINUSE` / `address already in use` / `errno 98` at the end of the log, e.g. torchrun's `DistNetworkError ... port: 29501 ... EADDRINUSE`):
+  the retry runs the command with a fresh `MASTER_PORT`, and the command itself asks the system for a free port when it starts
+  (`$(python3 -c '... bind(("", 0)) ...')`), so it is correct on the machine that really runs the training, also inside `srun` / `ssh` nested shells.
+  An existing `MASTER_PORT=<digits>` in the command is rewritten in place, otherwise `export MASTER_PORT=...;` is put in front. The script must read the
+  `MASTER_PORT` environment variable (`${MASTER_PORT:-default}`) and `python3` must be on the PATH of the window shell. Every retry gets a new port. The
+  `task.md` entry is not changed. Port retries count toward `--max-retries`. If the log reports the **same port** again after the switch (the script
+  hard-codes `--master_port`, so the override has no effect), the command moves to `failed list` at once with that reason instead of retrying in vain.
 - Any other error (read/write errors, ...) -> retry the command unchanged.
 - The tool waits `--retry-delay` seconds before each retry. If it still fails after `--max-retries` retries, or on an OOM when there is no
   `batch_size` left to reduce, the command moves to `failed list`, the reason is printed to the terminal (with the last 3 log lines),

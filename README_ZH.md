@@ -63,6 +63,12 @@ tmux 本身不提供命令的退出码，所以工具启动命令时在外面包
     旧 `accum_steps` 的读法同 `batch_size`：命令里的 `--accum_steps N`，没有则读日志 `print(args)` 里的 `accum_steps=N`，再没有按 1；
     新值在命令里原位改写，没有就**追加 `--accum_steps <新值>`**。8/1 → 4/2 → 2/4。`batch_size` 为奇数时减半取整、`accum_steps` 向上取整
     （5/1 → 2/3，逻辑 batch 由 5 变 6）。训练程序需支持 `--accum_steps`。
+- **端口被占用**（日志末尾含 `EADDRINUSE` / `address already in use` / `errno 98`，如 torchrun 的 `DistNetworkError ... port: 29501 ... EADDRINUSE`）：
+  重试时让命令改用新的 `MASTER_PORT`，由命令自己在启动时向系统要一个空闲端口（`$(python3 -c '... bind(("", 0)) ...')`），
+  所以在真正跑训练的那台机器上取到的才是对的，`srun` / `ssh` 嵌套 shell 里同样适用。命令里已有 `MASTER_PORT=数字` 就原位改写，否则在最前面加 `export MASTER_PORT=...;`。
+  要求脚本读环境变量 `MASTER_PORT`（`${MASTER_PORT:-默认值}`），窗口 shell 的 PATH 里有 `python3`。每次重试都会重新取端口，`task.md` 里的条目不会被改写。
+  端口重试计入 `--max-retries`。若换端口后日志里报的**还是同一个端口**（脚本写死了 `--master_port`，覆盖没生效），
+  直接移入 `failed list` 并写明原因，不再白白重试。
 - 其余错误（读写错误等）→ 原命令重试。
 - 每次重试前等待 `--retry-delay` 秒。超过 `--max-retries` 次仍失败，或 OOM 时找不到可再减小的 `--batch_size`，
   把命令移入 `failed list`，在终端打印原因（含日志最后 3 行），**窗口继续跑队列下一条**。

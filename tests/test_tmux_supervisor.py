@@ -477,6 +477,85 @@ class RetryTest(TmuxCase):
         self.assertGreaterEqual(stamps[1] - stamps[0], 1.4)
 
 
+class PortRetryTest(TmuxCase):
+    """端口被占用（EADDRINUSE）：重试时让命令改用一个临时取得的空闲 MASTER_PORT。"""
+
+    BUSY = ("torch.distributed.DistNetworkError: The server socket has failed to listen on any local network address. "
+            "port: {port}, useIpv6: false, code: -98, name: EADDRINUSE, message: address already in use")
+
+    def _script(self, always_busy_port=None):
+        """每次运行记录收到的 MASTER_PORT；第一次（always_busy_port 不为空时每次）报端口占用。"""
+        script = self.dir / "p.sh"
+        busy = self.BUSY.format(port=always_busy_port or "29501")
+        script.write_text(
+            'echo "port=$MASTER_PORT" >> seen\n'
+            + (f'echo "{busy}" >&2; exit 1\n' if always_busy_port else
+               f'if [ ! -f flag ]; then touch flag; echo "{busy}" >&2; exit 1; fi\n'
+               'echo ok >> seen\n'))
+        return script
+
+    def seen(self):
+        return (self.dir / "seen").read_text().split()
+
+    def test_port_in_use_retries_with_a_free_port(self):
+        script = self._script()
+        self.write_tasks(f"## task-list\nbash {script}\n")
+        self.drive(lambda: (self.dir / "seen").exists() and "ok" in self.seen())
+        first, second, ok = self.seen()
+        self.assertEqual(first, "port=")  # 命令里原本没有 MASTER_PORT
+        self.assertRegex(second, r"^port=\d{4,5}$")  # 重试时有了一个临时取得的端口
+        self.assertNotEqual(second, "port=29501")
+        self.assertIn("free MASTER_PORT", self.text())
+
+    def test_existing_master_port_prefix_is_rewritten_in_place(self):
+        script = self._script()
+        self.write_tasks(f"## task-list\nMASTER_PORT=29502 bash {script}\n")
+        self.drive(lambda: (self.dir / "seen").exists() and "ok" in self.seen())
+        first, second, _ = self.seen()
+        self.assertEqual(first, "port=29502")
+        self.assertRegex(second, r"^port=\d{4,5}$")
+        self.assertNotEqual(second, "port=29502")
+        self.assertEqual(self.win().tasks, [])  # task-list 里的原命令不被改写（已成功移走）
+        self.assertIn(f"MASTER_PORT=29502 bash {script}", self.win().worked[0])
+
+    def test_same_port_reported_again_means_override_is_not_applied(self):
+        script = self._script(always_busy_port=29501)  # 脚本不读 MASTER_PORT：换端口无效，永远报 29501
+        self.write_tasks(f"## task-list\nbash {script}\necho x > next\n")
+        self.drive(lambda: (self.dir / "next").exists())
+        self.assertEqual(len(self.seen()), 2)  # 只重试了一次，没有白白重试到 max_retries
+        self.assertEqual(len(self.win().failed), 1)
+        self.assertIn("MASTER_PORT", self.win().failed[0])
+
+    def test_port_retries_count_toward_max_retries(self):
+        script = self.dir / "p.sh"
+        script.write_text('echo "port=$MASTER_PORT" >> seen\n'
+                          'echo "RuntimeError: Address already in use ($RANDOM)" >&2; exit 1\n')  # 没有端口号可比，保护不触发
+        self.sup = self.make(max_retries=2)
+        self.write_tasks(f"## task-list\nbash {script}\necho x > next\n")
+        self.drive(lambda: (self.dir / "next").exists())
+        self.assertEqual(len(self.seen()), 3)  # 首次 + 2 次重试
+        self.assertIn("exceeded max_retries=2", self.win().failed[0])
+
+    def test_port_state_does_not_leak_into_the_next_task(self):
+        # 两个任务各自第一次都撞 29501：第二个任务不能因为沿用第一个任务的记录而被误判为"换端口没生效"
+        script = self.dir / "two.sh"
+        busy = self.BUSY.format(port=29501)
+        script.write_text(f'if [ ! -f flag$1 ]; then touch flag$1; echo "{busy}" >&2; exit 1; fi\necho ok$1 >> seen\n')
+        self.write_tasks(f"## task-list\nbash {script} A\nbash {script} B\n")
+        self.drive(lambda: len(self.win().worked) == 2)
+        self.assertEqual(self.win().failed, [])
+        self.assertEqual(self.seen(), ["okA", "okB"])
+
+    def test_port_in_use_patterns(self):
+        from tmux_supervisor.supervisor import PORT_BUSY_RE
+        for line in ("name: EADDRINUSE, message: address already in use",
+                     "OSError: [Errno 98] Address already in use",
+                     "failed to bind to [::]:29500 (errno: 98 - Address already in use)"):
+            self.assertTrue(PORT_BUSY_RE.search(line), line)
+        for line in ("CUDA out of memory", "Connection refused", "KeyError: 'port'"):
+            self.assertFalse(PORT_BUSY_RE.search(line), line)
+
+
 class ResumeTest(TmuxCase):
     def _script(self, with_ckpt: bool):
         # 第一次运行：打印 Namespace(output_dir=...)，可选地写出 checkpoint，然后失败；第二次运行：记录收到的参数

@@ -28,6 +28,13 @@ OOM_RE = re.compile(r"OutOfMemoryError"
                     r"|CUDA_ERROR_OUT_OF_MEMORY|(?:cuda|hip)Error(?:MemoryAllocation|OutOfMemory)"
                     r"|Tried to allocate [\d.]+ \w+ \(GPU \d"
                     r"|\bCU[A-Z]+_STATUS_ALLOC_FAILED", re.I)
+# 端口被占用：torch 的 TCPStore 报 EADDRINUSE / "address already in use"（errno 98）。重试时换一个 MASTER_PORT
+PORT_BUSY_RE = re.compile(r"EADDRINUSE|address already in use|errno[ :=]*98\b", re.I)
+# 报错行里的端口号（`port: 29501,` 或 `[::]:29500 (errno: 98 ...`），用来判断换端口有没有生效
+PORT_NUM_RE = re.compile(r"\bport:?\s*(\d+)|:(\d{4,5})\b", re.I)
+# 由运行命令的那台机器自己向系统要一个空闲端口（窗口可能是 srun 进计算节点的嵌套 shell，监控本机探测的结果不一定适用）
+FREE_PORT = "$(python3 -c 'import socket; s = socket.socket(); s.bind((\"\", 0)); print(s.getsockname()[1])')"
+MASTER_PORT_ARG_RE = re.compile(r"\bMASTER_PORT=\d+")
 # 命令行里的 batch_size 参数（支持 `--batch_size 4` 与 `--batch_size=4`），OOM 重试时改写它
 BATCH_ARG_RE = re.compile(r"(--batch_size[ =])(\d+)")
 # 训练程序启动时 print(args) 里的 batch_size=N，是本次运行实际生效的值（batch_size 写在脚本里时命令行上看不到）
@@ -134,6 +141,23 @@ def with_arg(cmd: str, arg_re: "re.Pattern", flag: str, value: int) -> str:
     if hits:
         return cmd[:hits[-1].start(2)] + str(value) + cmd[hits[-1].end(2):]
     return f"{cmd} {flag} {value}"
+
+
+def with_free_port(cmd: str) -> str:
+    """让命令每次运行都取一个新的空闲 MASTER_PORT：命令里已有 `MASTER_PORT=数字` 就原位改写，否则在最前面 export。
+    已经改过的命令原样返回（$(...) 每次运行都会重新取一个端口）。"""
+    if FREE_PORT in cmd:
+        return cmd
+    if MASTER_PORT_ARG_RE.search(cmd):
+        return MASTER_PORT_ARG_RE.sub(lambda m: f"MASTER_PORT={FREE_PORT}", cmd)
+    return f"export MASTER_PORT={FREE_PORT}; {cmd}"
+
+
+def busy_port(tail: str) -> Optional[int]:
+    """日志末尾最后一条端口被占用的报错里的端口号；没有端口号返回 None。"""
+    lines = [l for l in tail.splitlines() if PORT_BUSY_RE.search(l)]
+    m = PORT_NUM_RE.search(lines[-1]) if lines else None
+    return int(m.group(1) or m.group(2)) if m else None
 
 
 def with_resume(cmd: str, ckpt: Path) -> str:
@@ -358,7 +382,8 @@ class Supervisor:
         cmd = st["command"]
         if st["attempts"] >= self.max_retries:
             return self._fail(st, f"exceeded max_retries={self.max_retries} (exit code {rc})", log_lines=True)
-        if OOM_RE.search(self._log_tail(st["log"])):
+        tail = self._log_tail(st["log"])
+        if OOM_RE.search(tail):
             # 仅 CUDA OOM 才减小 batch_size；其他错误（读写错误等）保持原命令重试
             hits = list(BATCH_ARG_RE.finditer(cmd))
             m_log = BATCH_LOG_RE.search(self._log_head(st["log"]))
@@ -386,6 +411,15 @@ class Supervisor:
             # 命令里没有就追加到末尾：脚本把 "$@" 放在自己的参数之后，argparse 取最后一个
             cmd = with_arg(cmd, BATCH_ARG_RE, "--batch_size", new)
             cmd = with_arg(cmd, ACCUM_ARG_RE, "--accum_steps", new_acc)
+        elif PORT_BUSY_RE.search(tail):
+            port = busy_port(tail)
+            if st.get("port_swapped") and port is not None and port == st.get("busy_port"):
+                # 已经让命令改用空闲端口，日志里报的却还是同一个端口：脚本没读 MASTER_PORT（如写死了 --master_port），继续重试只会空转
+                return self._fail(st, f"port {port} is in use again after switching MASTER_PORT: the script does not use the "
+                                      f"MASTER_PORT environment variable", log_lines=True)
+            st["busy_port"], st["port_swapped"] = port, True
+            self.event(f"port in use{f' ({port})' if port else ''}: retrying with a free MASTER_PORT chosen at start")
+            cmd = with_free_port(cmd)
         else:
             self.event(f"command failed (exit code {rc}); retrying unchanged")
         st["attempts"] += 1
@@ -434,7 +468,7 @@ class Supervisor:
             self.event(f"FAILED: {raw} -> moved to failed list: shell syntax error")
             w = self._window()
         # 命令留在 task-list 首行，成功后才移走（见 _on_exit）
-        st.update(raw=raw, attempts=0, workdir=workdir, reason=None)
+        st.update(raw=raw, attempts=0, workdir=workdir, reason=None, busy_port=None, port_swapped=False)  # 端口记录按任务算，不带到下一条
         self._launch(w, st, cmd)
 
     def _launch(self, w: Window, st: dict, cmd: str, run_cmd: Optional[str] = None) -> None:
